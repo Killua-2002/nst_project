@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import math
 import random
 from pathlib import Path
@@ -40,17 +41,44 @@ def ensure_dir(path: Path) -> None:
 
 
 def _remove_small_objects_compat(mask: np.ndarray, min_size: int) -> np.ndarray:
-    try:
-        return remove_small_objects(mask, max_size=min_size)
-    except TypeError:  # older scikit-image
-        return _remove_small_objects_compat(mask, min_size=min_size)
+    """Version-safe wrapper for skimage.remove_small_objects.
+
+    The broken version used max_size on Colab builds that only accept min_size,
+    then recursively called itself in the except block.  This wrapper checks the
+    installed scikit-image signature and never recurses.
+    """
+    mask = mask.astype(bool)
+    params = inspect.signature(remove_small_objects).parameters
+    # New scikit-image builds renamed the size threshold to max_size;
+    # old Colab builds still use min_size.
+    if "max_size" in params:
+        try:
+            return remove_small_objects(mask, max_size=min_size)
+        except TypeError:
+            pass
+    if "min_size" in params:
+        try:
+            return remove_small_objects(mask, min_size=min_size)
+        except TypeError:
+            pass
+    return remove_small_objects(mask, min_size)
 
 
 def _remove_small_holes_compat(mask: np.ndarray, hole_area: int) -> np.ndarray:
-    try:
-        return remove_small_holes(mask, max_size=hole_area)
-    except TypeError:  # older scikit-image
-        return _remove_small_holes_compat(mask, hole_area=hole_area)
+    """Version-safe wrapper for skimage.remove_small_holes."""
+    mask = mask.astype(bool)
+    params = inspect.signature(remove_small_holes).parameters
+    if "max_size" in params:
+        try:
+            return remove_small_holes(mask, max_size=hole_area)
+        except TypeError:
+            pass
+    if "area_threshold" in params:
+        try:
+            return remove_small_holes(mask, area_threshold=hole_area)
+        except TypeError:
+            pass
+    return remove_small_holes(mask, hole_area)
 
 
 def read_gray(path: Path, image_size: int | None = None) -> np.ndarray:

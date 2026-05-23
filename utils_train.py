@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 import torch
 from torch.utils.data import Dataset
-import torchvision.transforms.functional as TF
 
 from config import NUM_CLASSES
 from utils_image import list_images, ensure_dir
@@ -43,26 +42,28 @@ class SegmentationDataset(Dataset):
 
     def _augment(self, img, lab):
         import random
-        # RandomResizedCrop equivalent for paired image/label.
+        # RandomResizedCrop equivalent for paired image/label, implemented with PIL
+        # to avoid torchvision binary compatibility issues on Colab/local machines.
         if random.random() < 0.80:
             scale = random.uniform(0.75, 1.0)
             crop = int(self.image_size * scale)
             if crop < self.image_size:
                 top = random.randint(0, self.image_size - crop)
                 left = random.randint(0, self.image_size - crop)
-                img = TF.resized_crop(img, top, left, crop, crop, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.BILINEAR)
-                lab = TF.resized_crop(lab, top, left, crop, crop, (self.image_size, self.image_size), interpolation=TF.InterpolationMode.NEAREST)
+                box = (left, top, left + crop, top + crop)
+                img = img.crop(box).resize((self.image_size, self.image_size), Image.BILINEAR)
+                lab = lab.crop(box).resize((self.image_size, self.image_size), Image.NEAREST)
 
         if random.random() < 0.5:
-            img = TF.hflip(img)
-            lab = TF.hflip(lab)
+            img = ImageOps.mirror(img)
+            lab = ImageOps.mirror(lab)
         if random.random() < 0.5:
-            img = TF.vflip(img)
-            lab = TF.vflip(lab)
+            img = ImageOps.flip(img)
+            lab = ImageOps.flip(lab)
 
         angle = random.uniform(-15, 15)
-        img = TF.rotate(img, angle, interpolation=TF.InterpolationMode.BILINEAR, fill=255)
-        lab = TF.rotate(lab, angle, interpolation=TF.InterpolationMode.NEAREST, fill=0)
+        img = img.rotate(angle, resample=Image.BILINEAR, fillcolor=255)
+        lab = lab.rotate(angle, resample=Image.NEAREST, fillcolor=0)
         return img, lab
 
     def __getitem__(self, idx):
@@ -71,7 +72,8 @@ class SegmentationDataset(Dataset):
         if self.augment:
             img, lab = self._augment(img, lab)
 
-        x = TF.to_tensor(img)  # [1,H,W], 0..1
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        x = torch.from_numpy(arr)[None, :, :]  # [1,H,W], 0..1
         y = torch.from_numpy(np.asarray(lab, dtype=np.int64))
         y = torch.clamp(y, min=0, max=NUM_CLASSES - 1)
         return x, y

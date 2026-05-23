@@ -1,155 +1,69 @@
-from __future__ import annotations
-
 import argparse
-import importlib
-from itertools import cycle
-
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
-from tqdm import tqdm
 
 import config
-from src.datasets import ChromosomeFolderDataset, UnlabeledChromosomeDataset
+from src.datasets import make_dataloaders, make_imagefolder_loader
+from src.models import build_model
 from src.train_utils import (
-    EarlyStopping,
-    classification_report_dict,
-    ensure_device,
-    evaluate,
-    save_confusion_matrix,
-    save_history_plot,
-    save_metrics_json,
+    build_student_train_from_synthetic_and_pseudo,
+    load_checkpoint,
+    pseudo_label_overlap_raw,
+    train_model,
 )
-
-models_mod = importlib.import_module("4v1_models")
-get_model = models_mod.get_model
-load_checkpoint = models_mod.load_checkpoint
+from src.utils import get_device, set_seed
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train Swin Transformer + ResNet50 FPN v2 student with teacher pseudo labels")
-    parser.add_argument("--teacher-ckpt", type=str, default=str(config.CHECKPOINT_DIR / "teacher_cci_net_best.pt"))
-    parser.add_argument("--epochs", type=int, default=config.EPOCHS)
-    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=config.LEARNING_RATE)
-    parser.add_argument("--threshold", type=float, default=config.PSEUDO_LABEL_THRESHOLD)
-    parser.add_argument("--unlabeled-weight", type=float, default=config.UNLABELED_LOSS_WEIGHT)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--student-model", type=str, default=config.STUDENT_MODEL)
-    parser.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights if internet/cache is available")
-    return parser.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Teacher-student semi-supervised training.")
+    parser.add_argument("--epochs", type=int, default=config.DEFAULT_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=config.DEFAULT_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=config.DEFAULT_LR)
+    parser.add_argument("--patience", type=int, default=config.DEFAULT_PATIENCE)
+    parser.add_argument("--dropout", type=float, default=config.DEFAULT_DROPOUT)
+    parser.add_argument("--threshold", type=float, default=config.DEFAULT_PSEUDO_THRESHOLD)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=2)
+    args = parser.parse_args()
 
+    set_seed(config.RANDOM_SEED)
+    config.ensure_project_dirs()
+    device = get_device(args.device)
 
-def main() -> None:
-    args = parse_args()
-    device = ensure_device(args.device)
-    print("Device:", device)
+    # Load teacher and pseudo-label real overlap_raw images.
+    base_loaders = make_dataloaders(config.DATASET_DIR, batch_size=args.batch_size, num_workers=args.num_workers)
+    class_names = base_loaders["class_names"]
+    teacher = build_model("teacher", num_classes=len(class_names), dropout=args.dropout, pretrained=False)
+    load_checkpoint(teacher, config.CHECKPOINT_DIR / "teacher_ccinet_best.pt", device)
+    pseudo_label_overlap_raw(
+        teacher=teacher,
+        overlap_dir=config.OVERLAP_RAW_DIR,
+        output_root=config.DATASET_DIR / "pseudo_labeled",
+        device=device,
+        class_names=class_names,
+        threshold=args.threshold,
+        batch_size=args.batch_size,
+    )
 
-    train_ds = ChromosomeFolderDataset(config.DATASET_DIR / "train", train=True)
-    val_ds = ChromosomeFolderDataset(config.DATASET_DIR / "val", train=False)
-    test_ds = ChromosomeFolderDataset(config.DATASET_DIR / "test", train=False)
-    unlabeled_ds = UnlabeledChromosomeDataset(config.DATASET_DIR / "unlabeled", strong=True)
+    # Build a student_train folder = synthetic train + accepted pseudo labels.
+    build_student_train_from_synthetic_and_pseudo(config.DATASET_DIR)
 
-    if len(train_ds) == 0:
-        raise RuntimeError("Empty training dataset. Run 3v1_build_dataset.py first.")
-    if len(unlabeled_ds) == 0:
-        print("[WARNING] dataset/unlabeled is empty. Student will train supervised only.")
+    # Reuse val/test synthetic for validation and testing.
+    train_ds, train_loader = make_imagefolder_loader(config.DATASET_DIR / "student_train", args.batch_size, train=True, num_workers=args.num_workers)
+    val_ds, val_loader = make_imagefolder_loader(config.DATASET_DIR / "val", args.batch_size, train=False, num_workers=args.num_workers)
+    test_ds, test_loader = make_imagefolder_loader(config.DATASET_DIR / "test", args.batch_size, train=False, num_workers=args.num_workers)
+    loaders = {
+        "train_ds": train_ds,
+        "val_ds": val_ds,
+        "test_ds": test_ds,
+        "train": train_loader,
+        "val": val_loader,
+        "test": test_loader,
+        "class_names": train_ds.classes,
+    }
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    unlabeled_loader = DataLoader(unlabeled_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True) if len(unlabeled_ds) else None
-
-    teacher = get_model(config.TEACHER_MODEL, num_classes=config.NUM_CLASSES, dropout=config.DROPOUT).to(device)
-    load_checkpoint(teacher, args.teacher_ckpt, map_location=device)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-
-    student = get_model(args.student_model, num_classes=config.NUM_CLASSES, dropout=config.DROPOUT, pretrained=args.pretrained).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
-    stopper = EarlyStopping(patience=config.EARLY_STOPPING_PATIENCE, mode="min")
-    best_path = config.CHECKPOINT_DIR / "student_swin_resnet50_fpn_v2_best.pt"
-
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": [], "val_f1": [], "pseudo_used": []}
-
-    for epoch in range(1, args.epochs + 1):
-        student.train()
-        total_loss, correct, total, pseudo_used = 0.0, 0, 0, 0
-        unlabeled_iter = cycle(unlabeled_loader) if unlabeled_loader is not None else None
-
-        for images, labels in tqdm(train_loader, desc=f"student train {epoch}", leave=False):
-            images = images.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = student(images)
-            supervised_loss = criterion(logits, labels)
-            loss = supervised_loss
-
-            if unlabeled_iter is not None:
-                u_images, _ = next(unlabeled_iter)
-                u_images = u_images.to(device)
-                with torch.no_grad():
-                    t_logits = teacher(u_images)
-                    probs = F.softmax(t_logits, dim=1)
-                    conf, pseudo = probs.max(dim=1)
-                    mask = conf >= args.threshold
-                if mask.any():
-                    s_logits = student(u_images[mask])
-                    unsup_loss = criterion(s_logits, pseudo[mask])
-                    loss = supervised_loss + args.unlabeled_weight * unsup_loss
-                    pseudo_used += int(mask.sum().item())
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += float(loss.item()) * images.size(0)
-            pred = logits.argmax(dim=1)
-            correct += int((pred == labels).sum().item())
-            total += int(labels.numel())
-
-        train_loss = total_loss / max(total, 1)
-        train_acc = correct / max(total, 1)
-        val_loss, val_acc, val_f1, y_true, y_pred = evaluate(student, val_loader, criterion, device)
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(train_acc)
-        history["val_acc"].append(val_acc)
-        history["val_f1"].append(val_f1)
-        history["pseudo_used"].append(pseudo_used)
-        print(f"Epoch {epoch:03d}/{args.epochs} | loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} pseudo_used={pseudo_used}")
-
-        if stopper.step(val_loss):
-            best_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "model_name": args.student_model,
-                "class_names": config.CLASS_NAMES,
-                "model_state": student.state_dict(),
-                "epoch": epoch,
-                "val_loss": val_loss,
-            }, best_path)
-            print("Saved best student:", best_path)
-        if stopper.should_stop:
-            print(f"Early stopping triggered after {config.EARLY_STOPPING_PATIENCE} epochs without improvement.")
-            break
-
-    student.load_state_dict(torch.load(best_path, map_location=device)["model_state"], strict=False)
-    test_loss, test_acc, test_f1, y_true, y_pred = evaluate(student, test_loader, criterion, device)
-
-    save_history_plot(history, config.RESULT_DIR / "student_loss.png")
-    save_confusion_matrix(y_true, y_pred, config.RESULT_DIR / "student_confusion_matrix.png", config.RESULT_DIR / "student_confusion_matrix.csv")
-    save_metrics_json({
-        "test_loss": test_loss,
-        "test_acc": test_acc,
-        "test_macro_f1": test_f1,
-        "classification_report": classification_report_dict(y_true, y_pred),
-        "history": history,
-        "pseudo_label_threshold": args.threshold,
-    }, config.RESULT_DIR / "student_metrics.json")
-    print(f"Student test_acc={test_acc:.4f}, test_macro_f1={test_f1:.4f}")
+    student = build_model("student", num_classes=len(class_names), dropout=args.dropout, pretrained=args.pretrained)
+    ckpt = train_model(student, loaders, device, "student_swin_resnet50fpnv2", epochs=args.epochs, lr=args.lr, patience=args.patience)
+    print("Student checkpoint saved:", ckpt)
 
 
 if __name__ == "__main__":

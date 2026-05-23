@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# training outputs; keep source_data in git if you want because user said data is uploaded to GitHub
+result/checkpoints/*.pt
+result/*.png
+result/*.csv
+generated_data/**/*.png
+generated_data/**/*.csv
+dataset/train/**/*.png
+dataset/val/**/*.png
+dataset/test/**/*.png
+dataset/pseudo_labeled/**/*.png
+dataset/student_train/**/*.png

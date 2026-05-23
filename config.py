@@ -1,81 +1,53 @@
-"""Global configuration for the chromosome classification project.
-
-Data assumption:
-- source_data/overlap_raw: real overlapped/touching chromosome images to solve/classify.
-- source_data/single_chromosomes or source_data/single_chromosome: only single chromosome images.
-- dataset/ is generated automatically from source_data/single_chromosomes.
-
-Fast default pipeline:
-source_data -> generated_data/resized grayscale 224x224 -> synthetic dataset -> Teacher -> pseudo labels -> Student.
-Zhang-Suen skeleton is optional because it is CPU-heavy.
-"""
 from pathlib import Path
+from dataclasses import dataclass
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+@dataclass
+class CFG:
+    PROJECT_ROOT: Path = Path(__file__).resolve().parent
 
-SOURCE_DIR = PROJECT_ROOT / "source_data"
-OVERLAP_RAW_DIR = SOURCE_DIR / "overlap_raw"
-SINGLE_CHROMOSOMES_DIR = SOURCE_DIR / "single_chromosomes"
-SINGLE_CHROMOSOME_ALT_DIR = SOURCE_DIR / "single_chromosome"
+    # Raw data folders. Keep these exactly as the GitHub data structure.
+    SOURCE_DIR: Path = PROJECT_ROOT / "source_data"
+    OVERLAP_RAW_DIR: Path = SOURCE_DIR / "overlap_raw"
+    SINGLE_CHR_DIR: Path = SOURCE_DIR / "single_chromosomes"
 
-GENERATED_DIR = PROJECT_ROOT / "generated_data"
-RESIZED_DIR = GENERATED_DIR / "resized"
-RESIZED_OVERLAP_RAW_DIR = RESIZED_DIR / "overlap_raw"
-RESIZED_SINGLE_CHROMOSOMES_DIR = RESIZED_DIR / "single_chromosomes"
+    # Auto-created working folders.
+    GENERATED_DIR: Path = PROJECT_ROOT / "generated_data"
+    RESIZED_DIR: Path = GENERATED_DIR / "resized"
+    DATASET_DIR: Path = PROJECT_ROOT / "dataset"
+    RESULT_DIR: Path = PROJECT_ROOT / "result"
 
-DATASET_DIR = PROJECT_ROOT / "dataset"
-RESULT_DIR = PROJECT_ROOT / "result"
-CHECKPOINT_DIR = RESULT_DIR / "checkpoints"
+    IMAGE_SIZE: int = 224
+    NUM_CLASSES: int = 4  # 0=background, 1=A-only, 2=B-only, 3=C-overlap
+    CLASS_NAMES = ["background", "A_only", "B_only", "C_overlap"]
 
-CLASSES = ["touching", "overlapping", "touching_overlapping"]
-NUM_CLASSES = len(CLASSES)
+    EPOCHS: int = 200
+    BATCH_SIZE: int = 64
+    LR: float = 1e-4
+    DROPOUT: float = 0.5
+    EARLY_STOPPING: int = 10
 
-IMAGE_SIZE = 224
-DEFAULT_EPOCHS = 200
-DEFAULT_BATCH_SIZE = 64
-DEFAULT_LR = 1e-4
-DEFAULT_DROPOUT = 0.5
-DEFAULT_PATIENCE = 10
-DEFAULT_SYNTHETIC_PER_CLASS = 600
-DEFAULT_PSEUDO_THRESHOLD = 0.75
-RANDOM_SEED = 42
+    # Synthetic data size per split.
+    SYNTHETIC_TRAIN: int = 600
+    SYNTHETIC_VAL: int = 120
+    SYNTHETIC_TEST: int = 120
 
-# Skeleton is OFF by default to keep Colab preprocessing fast.
-# Turn it on with: python main.py --use-skeleton
-RUN_SKELETON_DEFAULT = False
-SAVE_SKELETON_DEBUG_DEFAULT = False
-SKELETON_PAD = 8
+    # Skeleton is OFF by default because Zhang-Suen is CPU-heavy.
+    USE_SKELETON: bool = False
+    SAVE_SKELETON_DEBUG: bool = False
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    # Semi-supervised pseudo label settings.
+    PSEUDO_THRESHOLD: float = 0.65
+    PSEUDO_LOSS_WEIGHT: float = 0.35
 
-
-def get_single_dir() -> Path:
-    """Support both folder names: single_chromosomes and single_chromosome."""
-    if SINGLE_CHROMOSOMES_DIR.exists():
-        return SINGLE_CHROMOSOMES_DIR
-    if SINGLE_CHROMOSOME_ALT_DIR.exists():
-        return SINGLE_CHROMOSOME_ALT_DIR
-    return SINGLE_CHROMOSOMES_DIR
+    SEED: int = 42
 
 
-def ensure_project_dirs() -> None:
-    dirs = [
-        OVERLAP_RAW_DIR,
-        SINGLE_CHROMOSOMES_DIR,
-        GENERATED_DIR,
-        RESIZED_OVERLAP_RAW_DIR,
-        RESIZED_SINGLE_CHROMOSOMES_DIR,
-        DATASET_DIR / "train",
-        DATASET_DIR / "val",
-        DATASET_DIR / "test",
-        DATASET_DIR / "unlabeled",
-        DATASET_DIR / "pseudo_labeled",
-        DATASET_DIR / "student_train",
-        RESULT_DIR,
-        CHECKPOINT_DIR,
-    ]
-    for split in ["train", "val", "test", "pseudo_labeled", "student_train"]:
-        for cls in CLASSES:
-            dirs.append(DATASET_DIR / split / cls)
-    for folder in dirs:
-        folder.mkdir(parents=True, exist_ok=True)
+def resolve_single_chromosome_dir(source_dir: Path) -> Path:
+    """Accept both single_chromosomes and single_chromosome for safety."""
+    plural = source_dir / "single_chromosomes"
+    singular = source_dir / "single_chromosome"
+    if plural.exists():
+        return plural
+    if singular.exists():
+        return singular
+    return plural

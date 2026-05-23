@@ -13,22 +13,23 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dropout", type=float, default=config.DEFAULT_DROPOUT)
     parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument("--image-size", type=int, default=config.IMAGE_SIZE)
     args = parser.parse_args()
 
     device = get_device(args.device)
-    loaders = make_dataloaders(config.DATASET_DIR, batch_size=args.batch_size)
+    loaders = make_dataloaders(config.DATASET_DIR, batch_size=args.batch_size, image_size=args.image_size)
     class_names = loaders["class_names"]
 
     teacher = build_model("teacher", num_classes=len(class_names), dropout=args.dropout, pretrained=False)
     load_checkpoint(teacher, config.CHECKPOINT_DIR / "teacher_ccinet_best.pt", device)
     teacher.to(device)
-    teacher_metrics = evaluate_model(teacher, config.DATASET_DIR, device, "teacher_ccinet", args.batch_size)
+    teacher_metrics = evaluate_model(teacher, config.DATASET_DIR, device, "teacher_ccinet", args.batch_size, image_size=args.image_size)
     print("Teacher metrics:", teacher_metrics)
 
     student = build_model("student", num_classes=len(class_names), dropout=args.dropout, pretrained=args.pretrained)
     load_checkpoint(student, config.CHECKPOINT_DIR / "student_swin_resnet50fpnv2_best.pt", device)
     student.to(device)
-    student_metrics = evaluate_model(student, config.DATASET_DIR, device, "student_swin_resnet50fpnv2", args.batch_size)
+    student_metrics = evaluate_model(student, config.DATASET_DIR, device, "student_swin_resnet50fpnv2", args.batch_size, image_size=args.image_size)
     print("Student metrics:", student_metrics)
 
 

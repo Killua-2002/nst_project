@@ -1,12 +1,13 @@
 """Global configuration for the chromosome classification project.
 
-Data assumption for this fixed version:
+Data assumption:
 - source_data/overlap_raw: real overlapped/touching chromosome images to solve/classify.
 - source_data/single_chromosomes or source_data/single_chromosome: only single chromosome images.
-- There is no manually labeled training folder by default.
+- dataset/ is generated automatically from source_data/single_chromosomes.
 
-The training dataset is generated synthetically from single_chromosomes, then
-Teacher -> pseudo-labels overlap_raw -> Student trains with synthetic + pseudo data.
+Fast default pipeline:
+source_data -> generated_data/resized grayscale 224x224 -> synthetic dataset -> Teacher -> pseudo labels -> Student.
+Zhang-Suen skeleton is optional because it is CPU-heavy.
 """
 from pathlib import Path
 
@@ -18,12 +19,14 @@ SINGLE_CHROMOSOMES_DIR = SOURCE_DIR / "single_chromosomes"
 SINGLE_CHROMOSOME_ALT_DIR = SOURCE_DIR / "single_chromosome"
 
 GENERATED_DIR = PROJECT_ROOT / "generated_data"
+RESIZED_DIR = GENERATED_DIR / "resized"
+RESIZED_OVERLAP_RAW_DIR = RESIZED_DIR / "overlap_raw"
+RESIZED_SINGLE_CHROMOSOMES_DIR = RESIZED_DIR / "single_chromosomes"
+
 DATASET_DIR = PROJECT_ROOT / "dataset"
 RESULT_DIR = PROJECT_ROOT / "result"
 CHECKPOINT_DIR = RESULT_DIR / "checkpoints"
 
-# Classification classes generated from pairs of single chromosomes.
-# These follow the common CCI-Net style problem: touching / overlapping / both.
 CLASSES = ["touching", "overlapping", "touching_overlapping"]
 NUM_CLASSES = len(CLASSES)
 
@@ -36,6 +39,12 @@ DEFAULT_PATIENCE = 10
 DEFAULT_SYNTHETIC_PER_CLASS = 600
 DEFAULT_PSEUDO_THRESHOLD = 0.75
 RANDOM_SEED = 42
+
+# Skeleton is OFF by default to keep Colab preprocessing fast.
+# Turn it on with: python main.py --use-skeleton
+RUN_SKELETON_DEFAULT = False
+SAVE_SKELETON_DEBUG_DEFAULT = False
+SKELETON_PAD = 8
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -54,11 +63,14 @@ def ensure_project_dirs() -> None:
         OVERLAP_RAW_DIR,
         SINGLE_CHROMOSOMES_DIR,
         GENERATED_DIR,
+        RESIZED_OVERLAP_RAW_DIR,
+        RESIZED_SINGLE_CHROMOSOMES_DIR,
         DATASET_DIR / "train",
         DATASET_DIR / "val",
         DATASET_DIR / "test",
         DATASET_DIR / "unlabeled",
         DATASET_DIR / "pseudo_labeled",
+        DATASET_DIR / "student_train",
         RESULT_DIR,
         CHECKPOINT_DIR,
     ]

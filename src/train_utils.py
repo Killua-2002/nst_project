@@ -169,8 +169,8 @@ def save_confusion_and_report(y_true, y_pred, class_names: List[str], prefix: Pa
     return {"accuracy": accuracy_score(y_true, y_pred), "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0)}
 
 
-def evaluate_model(model: nn.Module, dataset_root: Path, device: torch.device, model_name: str, batch_size: int):
-    _ds, loader = make_imagefolder_loader(Path(dataset_root) / "test", batch_size=batch_size, train=False)
+def evaluate_model(model: nn.Module, dataset_root: Path, device: torch.device, model_name: str, batch_size: int, image_size: int = config.IMAGE_SIZE):
+    _ds, loader = make_imagefolder_loader(Path(dataset_root) / "test", batch_size=batch_size, train=False, image_size=image_size)
     criterion = nn.CrossEntropyLoss()
     _loss, acc, f1, y_true, y_pred, probs, paths = evaluate_loader(model, loader, criterion, device)
     metrics = save_confusion_and_report(y_true, y_pred, _ds.classes, config.RESULT_DIR / model_name)
@@ -195,13 +195,14 @@ def pseudo_label_overlap_raw(
     class_names: List[str],
     threshold: float = config.DEFAULT_PSEUDO_THRESHOLD,
     batch_size: int = config.DEFAULT_BATCH_SIZE,
+    image_size: int = config.IMAGE_SIZE,
 ) -> pd.DataFrame:
     clean_dir(output_root)
     for cls in class_names:
         (Path(output_root) / cls).mkdir(parents=True, exist_ok=True)
 
     image_paths = list_images(overlap_dir)
-    transform = get_transforms(train=False)
+    transform = get_transforms(image_size=image_size, train=False)
     ds = UnlabeledImageDataset(image_paths, transform=transform)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
     rows = []
@@ -254,9 +255,10 @@ def classify_folder(
     batch_size: int = config.DEFAULT_BATCH_SIZE,
     copy_to_class_folders: bool = True,
     output_folder: Path | None = None,
+    image_size: int = config.IMAGE_SIZE,
 ) -> pd.DataFrame:
     image_paths = list_images(folder)
-    ds = UnlabeledImageDataset(image_paths, transform=get_transforms(train=False))
+    ds = UnlabeledImageDataset(image_paths, transform=get_transforms(image_size=image_size, train=False))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
     model.eval().to(device)
     rows = []

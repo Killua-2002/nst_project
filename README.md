@@ -1,136 +1,192 @@
-# NST Project - Fixed Version for GitHub + Google Colab
+# NST Project - Resize All + Optional Zhang-Suen Skeleton
 
-## 1. Data assumption fixed
+## 1. Data gốc
 
-Project này **không yêu cầu folder labeled thủ công** nữa.
-
-Data gốc chỉ cần có:
+Project chỉ cần 2 folder ảnh gốc:
 
 ```text
 project/
 ├── source_data/
-│   ├── overlap_raw/           # ảnh NST chồng/chạm cần giải quyết/classify
-│   └── single_chromosomes/    # ảnh NST đơn lẻ
+│   ├── overlap_raw/           # ảnh NST chồng/chạm thật cần classify
+│   └── single_chromosomes/    # ảnh NST đơn lẻ để generate synthetic train data
 ```
 
-Nếu repo đang dùng tên folder `single_chromosome` thay vì `single_chromosomes`, code vẫn tự nhận.
+Nếu repo dùng tên `single_chromosome` thì code vẫn tự nhận, nhưng nên dùng `single_chromosomes` cho thống nhất.
 
-## 2. Ý tưởng pipeline
+## 2. Ý tưởng xử lý mới
 
-Vì data ban đầu chỉ có ảnh đơn lẻ và ảnh overlap_raw chưa gán nhãn, pipeline được chỉnh lại như sau:
+Zhang-Suen skeleton chạy lâu vì phải làm thinning và phân tích endpoint/branch point trên CPU. Vì vậy pipeline đã tách thành 2 chế độ:
 
 ```text
-single_chromosomes
+FAST MODE mặc định:
+source_data
     ↓
-Grayscale + binary + Zhang-Suen skeleton check
+grayscale + resize all ảnh về 224x224
     ↓
-Generate synthetic labeled dataset
-    ├── touching
-    ├── overlapping
-    └── touching_overlapping
+generated_data/resized/
     ↓
-Train Teacher: CCI-Net style
+generate synthetic dataset
     ↓
-Teacher pseudo-label overlap_raw
-    ↓
-Train Student: Swin Transformer + ResNet50 FPN v2
-    ↓
-Evaluate synthetic test + classify real overlap_raw
+train Teacher/Student
 ```
-
-## 3. Folder structure
 
 ```text
-project/
-├── source_data/
-│   ├── overlap_raw/
-│   └── single_chromosomes/
-│
-├── generated_data/
-│   ├── overlap_raw/
-│   │   ├── *_gray.png
-│   │   ├── *_binary.png
-│   │   ├── *_skeleton.png
-│   │   ├── *_overlay.png
-│   │   └── skeleton_stats.csv
-│   ├── single_chromosomes/
-│   └── all_skeleton_stats.csv
-│
-├── dataset/
-│   ├── train/
-│   │   ├── touching/
-│   │   ├── overlapping/
-│   │   └── touching_overlapping/
-│   ├── val/
-│   ├── test/
-│   ├── pseudo_labeled/
-│   └── student_train/
-│
-├── result/
-│   ├── checkpoints/
-│   ├── teacher_ccinet_confusion_matrix.png
-│   ├── student_swin_resnet50fpnv2_confusion_matrix.png
-│   ├── pseudo_labels_overlap_raw.csv
-│   ├── overlap_raw_predictions_student.csv
-│   └── classified_overlap_raw_student/
-│
-├── src/
-│   ├── datasets.py
-│   ├── models.py
-│   ├── skeleton_utils.py
-│   ├── synthetic_data.py
-│   ├── train_utils.py
-│   └── utils.py
-│
-├── 1v1_create.py
-├── 2v1_preprocess_zhang_suen.py
-├── 3v1_build_dataset.py
-├── 4v1_models.py
-├── 5v1_train_teacher.py
-├── 6v1_train_student_ssl.py
-├── 7v1_evaluate_compare.py
-├── 8v1_classify_overlap_raw.py
-├── config.py
-├── main.py
-├── requirements.txt
-└── note.md
+FULL SKELETON MODE tùy chọn:
+source_data
+    ↓
+grayscale + resize all ảnh về 224x224
+    ↓
+binary + padding viền + Zhang-Suen skeleton
+    ↓
+endpoint / junction / component statistics
+    ↓
+generated_data/*/preprocess_stats.csv
 ```
 
-## 4. Chức năng từng file
+Tức là **resize luôn chạy**, còn **skeleton có thể bật/tắt**.
+
+## 3. Folder output sau preprocess
+
+```text
+generated_data/
+├── resized/
+│   ├── overlap_raw/           # ảnh thật đã grayscale + resize
+│   └── single_chromosomes/    # ảnh đơn đã grayscale + resize
+├── overlap_raw/
+│   ├── preprocess_stats.csv
+│   └── skeleton_debug/        # chỉ có khi bật --save-skeleton-debug
+└── single_chromosomes/
+    ├── preprocess_stats.csv
+    └── skeleton_debug/        # chỉ có khi bật --save-skeleton-debug
+```
+
+`dataset/` không phải data gốc. Nó là data train/val/test tự sinh ra từ `source_data/single_chromosomes` hoặc `generated_data/resized/single_chromosomes`.
+
+## 4. Flow chính
+
+```text
+source_data/single_chromosomes
+    ↓
+grayscale + resize
+    ↓
+generated_data/resized/single_chromosomes
+    ↓
+generate synthetic train/val/test
+    ↓
+train Teacher = CCI-Net style
+    ↓
+Teacher pseudo-label ảnh overlap_raw
+    ↓
+train Student = Swin Transformer + ResNet50 FPN v2
+    ↓
+evaluate confusion matrix trên synthetic test
+    ↓
+classify ảnh thật overlap_raw
+```
+
+Ảnh `overlap_raw` thật không có label nên không tạo confusion matrix trực tiếp được. Confusion matrix chỉ tính trên synthetic test set.
+
+## 5. Chức năng từng file
 
 ### `1v1_create.py`
-Tạo/check folder structure của project.
+Tạo/check folder structure.
 
 ### `2v1_preprocess_zhang_suen.py`
-Xử lý ảnh:
+Preprocess ảnh gốc:
 
-- đọc ảnh gốc;
 - chuyển grayscale;
-- binarize;
-- padding viền bằng `np.pad`;
-- làm mỏng bằng thuật toán Zhang-Suen;
-- lưu ảnh gray/binary/skeleton/overlay;
-- thống kê endpoint, junction, skeleton component;
-- xác định:
-  - `valid_single_line`: ảnh NST đơn có đúng 1 đường skeleton, không phân nhánh, 2 endpoint;
-  - `valid_two_line_candidate`: ảnh có khả năng gồm 2 đường NST đơn.
+- resize/pad về kích thước vuông, mặc định `224x224`;
+- lưu ảnh resized vào `generated_data/resized/`;
+- nếu bật `--use-skeleton` thì chạy binary + padding + Zhang-Suen skeleton;
+- nếu bật thêm `--save-skeleton-debug` thì lưu ảnh gray/binary/skeleton/overlay để debug.
 
 ### `3v1_build_dataset.py`
-Tạo dataset train/val/test tự động từ ảnh `single_chromosomes`.
-
-Vì không có label thủ công, script tự generate ảnh synthetic gồm 2 NST đơn với 3 class:
+Generate synthetic dataset từ NST đơn:
 
 - `touching`
 - `overlapping`
 - `touching_overlapping`
 
+Mặc định script sẽ ưu tiên dùng ảnh đã resize trong `generated_data/resized/single_chromosomes`. Nếu chưa preprocess thì tự fallback về `source_data/single_chromosomes`.
+
 ### `4v1_models.py`
-In thông tin model và số parameter.
+In thông tin model và parameter.
 
 ### `5v1_train_teacher.py`
-Train Teacher model: CCI-Net style.
+Train Teacher model kiểu CCI-Net.
 
-Cấu hình mặc định:
+### `6v1_train_student_ssl.py`
+Teacher pseudo-label `overlap_raw`, sau đó train Student bằng synthetic + pseudo-label.
+
+### `7v1_evaluate_compare.py`
+Xuất confusion matrix, classification report và prediction CSV cho Teacher/Student trên synthetic test set.
+
+### `8v1_classify_overlap_raw.py`
+Classify ảnh thật trong `overlap_raw`, ưu tiên dùng ảnh đã resize trong `generated_data/resized/overlap_raw`.
+
+### `main.py`
+Chạy toàn bộ pipeline.
+
+## 6. Command nên dùng trên Colab
+
+### Chạy nhanh, skeleton tắt mặc định
+
+```bash
+python main.py --epochs 200 --batch-size 64 --lr 0.0001 --image-size 224 --device cuda
+```
+
+### Test nhanh trước khi train lâu
+
+```bash
+python main.py --epochs 2 --batch-size 8 --synthetic-per-class 30 --image-size 224 --device cuda
+```
+
+### Chỉ resize + build dataset, chưa train
+
+```bash
+python main.py --skip-train --synthetic-per-class 100 --image-size 224
+```
+
+### Bật Zhang-Suen skeleton nhưng không lưu ảnh debug
+
+```bash
+python main.py --use-skeleton --epochs 200 --batch-size 64 --lr 0.0001 --image-size 224 --device cuda
+```
+
+### Bật skeleton và lưu ảnh debug
+
+```bash
+python main.py --use-skeleton --save-skeleton-debug --skip-train --synthetic-per-class 50 --image-size 224
+```
+
+### Chạy từng bước
+
+```bash
+python 1v1_create.py
+python 2v1_preprocess_zhang_suen.py --image-size 224
+python 3v1_build_dataset.py --synthetic-per-class 600 --image-size 224
+python 5v1_train_teacher.py --epochs 200 --batch-size 64 --lr 0.0001 --device cuda --image-size 224
+python 6v1_train_student_ssl.py --epochs 200 --batch-size 64 --lr 0.0001 --device cuda --image-size 224
+python 7v1_evaluate_compare.py --batch-size 64 --device cuda --image-size 224
+python 8v1_classify_overlap_raw.py --model student --batch-size 64 --device cuda --image-size 224
+```
+
+## 7. Khi nào nên bật skeleton?
+
+Nên tắt skeleton khi:
+
+- đang train classification;
+- cần chạy nhanh trên Colab;
+- chỉ cần model predict class của ảnh.
+
+Nên bật skeleton khi:
+
+- cần kiểm tra hình thái NST;
+- cần endpoint/junction để giải thích trong report;
+- muốn lọc ảnh NST đơn bằng `--strict-single`;
+- chuẩn bị bước tách/cutting point sau classification.
+
+## 8. Config mặc định
 
 ```text
 Epoch: 200
@@ -139,84 +195,11 @@ Learning rate: 0.0001
 Loss: CrossEntropyLoss
 Dropout: 0.5
 Early stopping: 10
+Image size: 224
+Skeleton: OFF by default
+Augmentation: RandomResizedCrop, RandomHorizontalFlip, RandomVerticalFlip, RandomRotation(15°)
 ```
 
-### `6v1_train_student_ssl.py`
-Semi-Supervised Learning Teacher-Student:
+## 9. Lưu ý kỹ thuật
 
-1. Load Teacher checkpoint.
-2. Teacher pseudo-label ảnh thật trong `source_data/overlap_raw`.
-3. Ảnh pseudo-label có confidence đủ cao được copy vào `dataset/pseudo_labeled`.
-4. Train Student bằng synthetic dataset + pseudo-label dataset.
-
-Student model:
-
-```text
-Swin Transformer + ResNet50 FPN v2
-```
-
-### `7v1_evaluate_compare.py`
-Đánh giá Teacher và Student trên synthetic test set, xuất:
-
-- confusion matrix PNG;
-- confusion matrix CSV;
-- classification report CSV;
-- test predictions CSV.
-
-### `8v1_classify_overlap_raw.py`
-Dùng checkpoint để classify ảnh thật trong `source_data/overlap_raw`.
-
-Output:
-
-```text
-result/overlap_raw_predictions_student.csv
-result/classified_overlap_raw_student/
-```
-
-### `main.py`
-Chạy toàn bộ pipeline.
-
-## 5. Cách chạy local hoặc Colab
-
-Cài thư viện:
-
-```bash
-pip install -r requirements.txt
-```
-
-Chạy full pipeline:
-
-```bash
-python main.py --epochs 200 --batch-size 64 --lr 0.0001 --device cuda
-```
-
-Chạy test nhanh:
-
-```bash
-python main.py --epochs 2 --batch-size 8 --synthetic-per-class 30 --device cuda
-```
-
-Chỉ preprocess + build dataset, chưa train:
-
-```bash
-python main.py --skip-train --synthetic-per-class 100
-```
-
-Chạy từng bước:
-
-```bash
-python 1v1_create.py
-python 2v1_preprocess_zhang_suen.py
-python 3v1_build_dataset.py --synthetic-per-class 600
-python 5v1_train_teacher.py --epochs 200 --batch-size 64 --lr 0.0001 --device cuda
-python 6v1_train_student_ssl.py --epochs 200 --batch-size 64 --lr 0.0001 --device cuda
-python 7v1_evaluate_compare.py --batch-size 64 --device cuda
-python 8v1_classify_overlap_raw.py --model student --batch-size 64 --device cuda
-```
-
-## 6. Lưu ý quan trọng
-
-- Project này là **image classification**, nên output chính là class/prediction của ảnh cluster, không phải mask pixel-level.
-- Nếu cần tách chính xác từng NST thành mask A/B/overlap C thì phải chuyển sang segmentation như U-Net, Mask R-CNN hoặc DaCSeg.
-- Ảnh train được đọc và xử lý theo grayscale. Khi đưa vào Swin/ResNet, gray channel được lặp thành 3 channel để tương thích backbone, nhưng không thêm thông tin màu.
-- Nếu data thật trong `overlap_raw` chưa có ground-truth label, confusion matrix chỉ đánh giá được trên synthetic test set. `overlap_raw` sẽ có file prediction/pseudo-label riêng.
+Project này là **image classification**, không phải pixel-level segmentation. Nó phân loại cụm NST thành class. Nếu cần tách chính xác NST A/B hoặc overlap mask C thì cần thêm module segmentation/cutting sau classification.

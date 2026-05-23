@@ -79,6 +79,8 @@ def print_data_status() -> None:
     print("Project root:", config.PROJECT_ROOT)
     print("overlap_raw:", config.OVERLAP_RAW_DIR, "images=", len(list_images(config.OVERLAP_RAW_DIR)))
     print("single_chromosomes:", single_dir, "images=", len(list_images(single_dir)))
+    print("resized overlap_raw:", config.RESIZED_OVERLAP_RAW_DIR, "images=", len(list_images(config.RESIZED_OVERLAP_RAW_DIR)))
+    print("resized single_chromosomes:", config.RESIZED_SINGLE_CHROMOSOMES_DIR, "images=", len(list_images(config.RESIZED_SINGLE_CHROMOSOMES_DIR)))
     for split in ["train", "val", "test", "pseudo_labeled", "student_train"]:
         root = config.DATASET_DIR / split
         if root.exists():

@@ -6,12 +6,12 @@ from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps
+from PIL import Image
 from tqdm import tqdm
 
 import config
-from src.skeleton_utils import binarize_chromosome, read_grayscale, skeletonize_with_padding, analyze_skeleton
-from src.utils import clean_dir, list_images, safe_name, set_seed
+from src.skeleton_utils import analyze_skeleton, binarize_chromosome, read_grayscale, skeletonize_with_padding
+from src.utils import clean_dir, list_images, set_seed
 
 
 def crop_foreground(gray: np.ndarray) -> Image.Image:
@@ -26,23 +26,44 @@ def crop_foreground(gray: np.ndarray) -> Image.Image:
     return Image.fromarray(crop).convert("L")
 
 
-def load_single_chromosomes(single_dir: Path, image_size: int = config.IMAGE_SIZE, strict_single: bool = False) -> List[Image.Image]:
+def load_single_chromosomes(
+    single_dir: Path,
+    image_size: int = config.IMAGE_SIZE,
+    strict_single: bool = False,
+    run_skeleton: bool = config.RUN_SKELETON_DEFAULT,
+    skeleton_pad: int = config.SKELETON_PAD,
+) -> List[Image.Image]:
+    """Load NST đơn images for synthetic generation.
+
+    Skeleton validation is skipped by default for speed. It is automatically enabled
+    when strict_single=True because that rule needs endpoints/junctions.
+    """
+    if strict_single:
+        run_skeleton = True
+
     images = []
     stats_rows = []
-    for path in list_images(single_dir):
-        gray = read_grayscale(path, image_size=None)
-        binary = binarize_chromosome(gray)
-        skel = skeletonize_with_padding(binary, pad=8)
-        stats = analyze_skeleton(binary, skel)
-        stats["file"] = str(path)
-        stats_rows.append(stats)
-        if strict_single and not stats.get("valid_single_line", False):
-            continue
+    for path in tqdm(list_images(single_dir), desc="load single chromosomes"):
+        # Resize here too, so generation is consistent even if preprocessing was skipped.
+        gray = read_grayscale(path, image_size=image_size)
+
+        if run_skeleton:
+            binary = binarize_chromosome(gray)
+            skel = skeletonize_with_padding(binary, pad=skeleton_pad)
+            stats = analyze_skeleton(binary, skel)
+            stats["file"] = str(path)
+            stats_rows.append(stats)
+            if strict_single and not stats.get("valid_single_line", False):
+                continue
+
         images.append(crop_foreground(gray))
 
     out_csv = config.GENERATED_DIR / "single_chromosome_validation.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(stats_rows).to_csv(out_csv, index=False)
+    if stats_rows:
+        pd.DataFrame(stats_rows).to_csv(out_csv, index=False)
+    else:
+        pd.DataFrame([{"skeleton_mode": "skipped", "source": str(single_dir)}]).to_csv(out_csv, index=False)
     return images
 
 
@@ -73,7 +94,6 @@ def paste_chromosome(canvas: np.ndarray, obj: Image.Image, center: Tuple[int, in
     region = canvas[y1:y2, x1:x2]
     arr_crop = arr[sy1:sy2, sx1:sx2]
     mask_crop = mask[sy1:sy2, sx1:sx2]
-    # Darker pixel wins, simulating overlap/foreground on bright background.
     region[mask_crop] = np.minimum(region[mask_crop], arr_crop[mask_crop])
     canvas[y1:y2, x1:x2] = region
     return canvas
@@ -91,10 +111,8 @@ def generate_pair(single_images: List[Image.Image], cls: str, image_size: int = 
         center1 = (cx + random.randint(-5, 5), cy + random.randint(-5, 5))
         center2 = (cx + random.randint(-5, 5), cy + random.randint(-5, 5))
         angle1 = random.uniform(-70, 70)
-        # Encourage crossing angle.
         angle2 = angle1 + random.choice([-1, 1]) * random.uniform(45, 100)
     elif cls == "touching":
-        # Two objects close, edge-touching or almost touching.
         offset = random.randint(35, 55)
         theta = random.uniform(0, 2 * np.pi)
         dx, dy = int(np.cos(theta) * offset), int(np.sin(theta) * offset)
@@ -116,7 +134,6 @@ def generate_pair(single_images: List[Image.Image], cls: str, image_size: int = 
     canvas = paste_chromosome(canvas, obj1, center1, angle1, scale1)
     canvas = paste_chromosome(canvas, obj2, center2, angle2, scale2)
 
-    # Light blur/noise to look less synthetic while staying grayscale.
     img = Image.fromarray(canvas, mode="L")
     if random.random() < 0.4:
         arr = np.array(img).astype(np.int16)
@@ -143,16 +160,23 @@ def build_synthetic_dataset(
     image_size: int = config.IMAGE_SIZE,
     seed: int = config.RANDOM_SEED,
     strict_single: bool = False,
+    run_skeleton: bool = config.RUN_SKELETON_DEFAULT,
+    skeleton_pad: int = config.SKELETON_PAD,
 ) -> pd.DataFrame:
     set_seed(seed)
-    single_images = load_single_chromosomes(single_dir, image_size=image_size, strict_single=strict_single)
+    single_images = load_single_chromosomes(
+        single_dir,
+        image_size=image_size,
+        strict_single=strict_single,
+        run_skeleton=run_skeleton,
+        skeleton_pad=skeleton_pad,
+    )
     if len(single_images) < 2:
         raise RuntimeError(
             f"Need at least 2 usable single chromosome images in {single_dir}. "
             "Put more images into source_data/single_chromosomes."
         )
 
-    # Rebuild only train/val/test synthetic folders.
     for split in ["train", "val", "test"]:
         clean_dir(Path(dataset_dir) / split)
         for cls in config.CLASSES:

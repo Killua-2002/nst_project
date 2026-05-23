@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Tuple
 
 import torch
 from PIL import Image
@@ -33,11 +32,7 @@ class UnlabeledImageDataset(torch.utils.data.Dataset):
 
 
 def get_transforms(image_size: int = config.IMAGE_SIZE, train: bool = True):
-    """Images are stored/read as grayscale.
-
-    Backbone models usually expect 3 channels, so Grayscale(3) repeats the same
-    gray channel three times without adding color information.
-    """
+    """Images are read as grayscale and repeated to 3 channels for backbone models."""
     if train:
         return transforms.Compose([
             transforms.Grayscale(num_output_channels=3),
@@ -56,9 +51,9 @@ def get_transforms(image_size: int = config.IMAGE_SIZE, train: bool = True):
     ])
 
 
-def make_imagefolder_loader(root: Path, batch_size: int, train: bool, num_workers: int = 2):
+def make_imagefolder_loader(root: Path, batch_size: int, train: bool, num_workers: int = 2, image_size: int = config.IMAGE_SIZE):
     root = Path(root)
-    ds = ImageFolderWithPaths(root, transform=get_transforms(train=train))
+    ds = ImageFolderWithPaths(root, transform=get_transforms(image_size=image_size, train=train))
     loader = DataLoader(
         ds,
         batch_size=batch_size,
@@ -69,11 +64,16 @@ def make_imagefolder_loader(root: Path, batch_size: int, train: bool, num_worker
     return ds, loader
 
 
-def make_dataloaders(dataset_dir: Path, batch_size: int = config.DEFAULT_BATCH_SIZE, num_workers: int = 2):
+def make_dataloaders(
+    dataset_dir: Path,
+    batch_size: int = config.DEFAULT_BATCH_SIZE,
+    num_workers: int = 2,
+    image_size: int = config.IMAGE_SIZE,
+):
     dataset_dir = Path(dataset_dir)
-    train_ds, train_loader = make_imagefolder_loader(dataset_dir / "train", batch_size, train=True, num_workers=num_workers)
-    val_ds, val_loader = make_imagefolder_loader(dataset_dir / "val", batch_size, train=False, num_workers=num_workers)
-    test_ds, test_loader = make_imagefolder_loader(dataset_dir / "test", batch_size, train=False, num_workers=num_workers)
+    train_ds, train_loader = make_imagefolder_loader(dataset_dir / "train", batch_size, train=True, num_workers=num_workers, image_size=image_size)
+    val_ds, val_loader = make_imagefolder_loader(dataset_dir / "val", batch_size, train=False, num_workers=num_workers, image_size=image_size)
+    test_ds, test_loader = make_imagefolder_loader(dataset_dir / "test", batch_size, train=False, num_workers=num_workers, image_size=image_size)
     return {
         "train_ds": train_ds,
         "val_ds": val_ds,

@@ -1,191 +1,390 @@
 from __future__ import annotations
 
+import csv
+import math
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-
-
-def seed_everything(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
+try:
+    from skimage.filters import threshold_otsu
+    from skimage.morphology import skeletonize, remove_small_objects, remove_small_holes, binary_closing, binary_opening, binary_dilation, binary_erosion, disk
     try:
-        import torch
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        from skimage.morphology import closing as morph_closing, opening as morph_opening
     except Exception:
-        pass
+        morph_closing, morph_opening = binary_closing, binary_opening
+    from skimage.measure import label as cc_label
+except Exception as exc:  # pragma: no cover
+    raise ImportError(
+        "Missing scikit-image. Install with: pip install scikit-image"
+    ) from exc
+
+from config import IMAGE_EXTS
 
 
 def list_images(folder: Path) -> List[Path]:
     folder = Path(folder)
     if not folder.exists():
         return []
-    return sorted([p for p in folder.rglob("*") if p.suffix.lower() in IMG_EXTS])
+    return sorted([p for p in folder.rglob("*") if p.suffix.lower() in IMAGE_EXTS])
 
 
-def ensure_dir(path: Path) -> Path:
+def ensure_dir(path: Path) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
-    return Path(path)
 
 
-def read_gray(path: Path) -> np.ndarray:
-    arr = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if arr is None:
-        pil = Image.open(path).convert("L")
-        arr = np.array(pil)
-    return arr
 
 
-def resize_square(gray: np.ndarray, size: int = 224) -> np.ndarray:
-    return cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+def _remove_small_objects_compat(mask: np.ndarray, min_size: int) -> np.ndarray:
+    try:
+        return remove_small_objects(mask, max_size=min_size)
+    except TypeError:  # older scikit-image
+        return _remove_small_objects_compat(mask, min_size=min_size)
 
 
-def otsu_foreground_mask(gray: np.ndarray) -> np.ndarray:
-    """Return foreground mask for chromosome, robust to dark-on-light or light-on-dark."""
-    if gray.dtype != np.uint8:
-        gray = np.clip(gray, 0, 255).astype(np.uint8)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    m1 = th > 0
-    m2 = ~m1
+def _remove_small_holes_compat(mask: np.ndarray, hole_area: int) -> np.ndarray:
+    try:
+        return remove_small_holes(mask, max_size=hole_area)
+    except TypeError:  # older scikit-image
+        return _remove_small_holes_compat(mask, hole_area=hole_area)
+
+
+def read_gray(path: Path, image_size: int | None = None) -> np.ndarray:
+    img = Image.open(path).convert("L")
+    if image_size is not None:
+        img = img.resize((image_size, image_size), Image.BILINEAR)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def save_gray(path: Path, arr: np.ndarray) -> None:
+    ensure_dir(path.parent)
+    Image.fromarray(arr.astype(np.uint8), mode="L").save(path)
+
+
+def save_label(path: Path, label: np.ndarray) -> None:
+    ensure_dir(path.parent)
+    Image.fromarray(label.astype(np.uint8), mode="L").save(path)
+
+
+def foreground_mask(gray: np.ndarray) -> np.ndarray:
+    """Return chromosome foreground as boolean mask.
+
+    Most G-band chromosome crops are dark chromosome on bright background.
+    This function also handles inverted images by choosing the more plausible
+    small connected foreground.
+    """
+    if gray.ndim != 2:
+        raise ValueError("foreground_mask expects grayscale image")
+    # Avoid otsu crash on constant images.
+    if gray.max() == gray.min():
+        return np.zeros_like(gray, dtype=bool)
+
+    t = threshold_otsu(gray)
+    dark = gray < t
+    light = gray > t
 
     def score(mask: np.ndarray) -> float:
-        # Prefer smaller foreground not touching full background too much.
-        area = mask.mean()
-        if area <= 0.001 or area >= 0.95:
-            return -1e9
-        # Chromosomes usually occupy less than half image.
-        return -abs(area - 0.12)
+        ratio = float(mask.mean())
+        # chromosome usually occupies around 1% to 60%.
+        if ratio < 0.002 or ratio > 0.75:
+            return 999.0
+        return abs(ratio - 0.18)
 
-    mask = m1 if score(m1) > score(m2) else m2
-
-    # Keep largest connected component to remove dust.
-    mask_uint = mask.astype(np.uint8)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_uint, 8)
-    if num > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        keep = 1 + int(np.argmax(areas))
-        mask = labels == keep
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel, iterations=1) > 0
-    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=1) > 0
-    return mask.astype(np.uint8)
+    return dark if score(dark) <= score(light) else light
 
 
-def crop_object(gray: np.ndarray, mask: np.ndarray, pad: int = 6) -> Tuple[np.ndarray, np.ndarray]:
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
-        return gray.copy(), mask.copy()
-    y1, y2 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, gray.shape[0])
-    x1, x2 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, gray.shape[1])
-    return gray[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy()
+def clean_mask(mask: np.ndarray, min_size: int = 30) -> np.ndarray:
+    mask = mask.astype(bool)
+    if mask.sum() == 0:
+        return mask
+    mask = morph_opening(mask, disk(1))
+    mask = morph_closing(mask, disk(1))
+    mask = _remove_small_objects_compat(mask, min_size=min_size)
+    return mask.astype(bool)
 
 
-def rotate_image_and_mask(img: np.ndarray, mask: np.ndarray, angle: float, bg_value: int = 255) -> Tuple[np.ndarray, np.ndarray]:
-    h, w = img.shape[:2]
-    center = (w / 2, h / 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cos = abs(M[0, 0]); sin = abs(M[0, 1])
-    nw = int((h * sin) + (w * cos))
-    nh = int((h * cos) + (w * sin))
-    M[0, 2] += (nw / 2) - center[0]
-    M[1, 2] += (nh / 2) - center[1]
-    rot_img = cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LINEAR, borderValue=bg_value)
-    rot_mask = cv2.warpAffine(mask.astype(np.uint8) * 255, M, (nw, nh), flags=cv2.INTER_NEAREST, borderValue=0) > 0
-    return rot_img, rot_mask.astype(np.uint8)
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    mask = mask.astype(bool)
+    if mask.sum() == 0:
+        return mask
+    lab = cc_label(mask, connectivity=2)
+    if lab.max() == 0:
+        return mask
+    counts = np.bincount(lab.ravel())
+    counts[0] = 0
+    return lab == counts.argmax()
 
 
-def resize_object(img: np.ndarray, mask: np.ndarray, target_long_side: int) -> Tuple[np.ndarray, np.ndarray]:
-    h, w = img.shape[:2]
-    if max(h, w) == 0:
-        return img, mask
-    scale = target_long_side / max(h, w)
-    nw, nh = max(2, int(w * scale)), max(2, int(h * scale))
-    img2 = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-    mask2 = cv2.resize(mask.astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
-    return img2, mask2.astype(np.uint8)
 
 
-def paste_object(canvas: np.ndarray, obj: np.ndarray, mask: np.ndarray, center_xy: Tuple[int, int]) -> np.ndarray:
-    out = canvas.copy()
-    H, W = canvas.shape[:2]
-    h, w = obj.shape[:2]
-    cx, cy = center_xy
-    x1 = int(cx - w // 2); y1 = int(cy - h // 2)
-    x2 = x1 + w; y2 = y1 + h
 
-    ox1 = max(0, -x1); oy1 = max(0, -y1)
-    ox2 = w - max(0, x2 - W); oy2 = h - max(0, y2 - H)
-    tx1 = max(0, x1); ty1 = max(0, y1)
-    tx2 = min(W, x2); ty2 = min(H, y2)
+def skeleton_quality_score(info: Dict[str, int | str | float]) -> float:
+    """Lower is better. Used to pick the smoothest chromosome-like mask.
 
-    if tx1 >= tx2 or ty1 >= ty2:
-        return out
-    roi = out[ty1:ty2, tx1:tx2]
-    obj_roi = obj[oy1:oy2, ox1:ox2]
-    mask_roi = mask[oy1:oy2, ox1:ox2] > 0
-    roi[mask_roi] = np.minimum(roi[mask_roi], obj_roi[mask_roi])
-    out[ty1:ty2, tx1:tx2] = roi
-    return out
-
-
-def paste_mask(mask_canvas: np.ndarray, mask: np.ndarray, center_xy: Tuple[int, int]) -> np.ndarray:
-    out = mask_canvas.copy()
-    H, W = mask_canvas.shape[:2]
-    h, w = mask.shape[:2]
-    cx, cy = center_xy
-    x1 = int(cx - w // 2); y1 = int(cy - h // 2)
-    x2 = x1 + w; y2 = y1 + h
-
-    ox1 = max(0, -x1); oy1 = max(0, -y1)
-    ox2 = w - max(0, x2 - W); oy2 = h - max(0, y2 - H)
-    tx1 = max(0, x1); ty1 = max(0, y1)
-    tx2 = min(W, x2); ty2 = min(H, y2)
-    if tx1 >= tx2 or ty1 >= ty2:
-        return out
-    roi = out[ty1:ty2, tx1:tx2]
-    roi[mask[oy1:oy2, ox1:ox2] > 0] = 1
-    out[ty1:ty2, tx1:tx2] = roi
-    return out
+    A good A/B chromosome mask should be one connected object whose skeleton is
+    one clean path: 2 endpoints, 0 branch points. This does not replace model
+    learning; it is a post-processing shape prior to stop holey / fragmented
+    segmentation output.
+    """
+    status = str(info.get("status", ""))
+    if status == "valid_single_path":
+        return 0.0
+    pixels = int(info.get("skeleton_pixels", 0))
+    if pixels <= 0:
+        return 10_000.0
+    components = int(info.get("components", 0))
+    endpoints = int(info.get("endpoints", 0))
+    branches = int(info.get("branch_points", 0))
+    return (
+        abs(components - 1) * 80.0
+        + abs(endpoints - 2) * 35.0
+        + branches * 20.0
+        + (0 if components >= 1 else 200.0)
+    )
 
 
-def label_to_masks(label: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # label: 0 background, 1 A-only, 2 B-only, 3 overlap C.
-    mask_a = ((label == 1) | (label == 3)).astype(np.uint8) * 255
-    mask_b = ((label == 2) | (label == 3)).astype(np.uint8) * 255
-    mask_c = (label == 3).astype(np.uint8) * 255
-    return mask_a, mask_b, mask_c
+def refine_binary_mask(
+    mask: np.ndarray,
+    foreground: np.ndarray | None = None,
+    close_radius: int = 2,
+    hole_area: int = 512,
+    min_size: int = 30,
+    keep_largest: bool = True,
+    foreground_margin: int = 2,
+) -> np.ndarray:
+    """Clean a predicted chromosome mask.
+
+    Main fixes:
+    - fill internal holes so A/B are not spotty;
+    - close tiny gaps in the chromosome body;
+    - remove small islands;
+    - optionally keep one main chromosome component;
+    - optionally constrain to a dilated foreground extracted from the original image.
+    """
+    original = mask.astype(bool)
+    mask = original.copy()
+
+    if foreground is not None and foreground.any():
+        fg = foreground.astype(bool)
+        if foreground_margin > 0:
+            fg = binary_dilation(fg, disk(foreground_margin))
+        restricted = mask & fg
+        # Do not destroy the prediction if Otsu foreground is imperfect.
+        if restricted.sum() >= max(8, int(mask.sum() * 0.35)):
+            mask = restricted
+
+    if close_radius > 0:
+        mask = morph_closing(mask, disk(close_radius))
+    if hole_area > 0:
+        mask = _remove_small_holes_compat(mask, hole_area=hole_area)
+    if min_size > 0:
+        mask = _remove_small_objects_compat(mask, min_size=min_size)
+    if keep_largest:
+        mask = largest_component(mask)
+    if close_radius > 0:
+        mask = morph_closing(mask, disk(max(1, close_radius // 2)))
+    if hole_area > 0:
+        mask = _remove_small_holes_compat(mask, hole_area=max(16, hole_area // 2))
+    return mask.astype(bool)
 
 
-def save_label_and_masks(label: np.ndarray, out_label: Path, out_a: Path, out_b: Path, out_c: Path) -> None:
-    ensure_dir(out_label.parent); ensure_dir(out_a.parent); ensure_dir(out_b.parent); ensure_dir(out_c.parent)
-    Image.fromarray(label.astype(np.uint8)).save(out_label)
-    a, b, c = label_to_masks(label)
-    Image.fromarray(a).save(out_a)
-    Image.fromarray(b).save(out_b)
-    Image.fromarray(c).save(out_c)
+def refine_single_chromosome_shape(
+    mask: np.ndarray,
+    foreground: np.ndarray | None = None,
+    min_size: int = 30,
+    close_radius: int = 2,
+    hole_area: int = 512,
+    keep_largest: bool = True,
+    skeleton_repair: bool = True,
+) -> Tuple[np.ndarray, Dict[str, int | str | float]]:
+    """Refine A or B so the output keeps chromosome-like shape.
+
+    The model gives pixel probabilities. This function adds a morphology +
+    Zhang-Suen quality prior after prediction. It tries a few close/fill settings
+    and chooses the mask whose skeleton is closest to a single unbranched path.
+    """
+    base = refine_binary_mask(
+        mask,
+        foreground=foreground,
+        close_radius=close_radius,
+        hole_area=hole_area,
+        min_size=min_size,
+        keep_largest=keep_largest,
+    )
+    best = base
+    best_info = analyze_skeleton(best, already_skeleton=False)
+    best_score = skeleton_quality_score(best_info)
+
+    if not skeleton_repair:
+        return best.astype(bool), best_info
+
+    # Try stronger smoothing/filling when the first mask is holey or fragmented.
+    close_values = sorted(set([1, close_radius, close_radius + 1, close_radius + 2]))
+    hole_values = sorted(set([64, hole_area, hole_area * 2, hole_area * 4]))
+    for cr in close_values:
+        for ha in hole_values:
+            cand = refine_binary_mask(
+                mask,
+                foreground=foreground,
+                close_radius=cr,
+                hole_area=ha,
+                min_size=min_size,
+                keep_largest=keep_largest,
+            )
+            info = analyze_skeleton(cand, already_skeleton=False)
+            score = skeleton_quality_score(info)
+            # Prefer skeleton-valid candidates, but avoid a mask that shrinks too much.
+            area_ratio = cand.sum() / max(1, base.sum())
+            if area_ratio < 0.55 or area_ratio > 1.80:
+                score += 50.0
+            if score < best_score:
+                best, best_info, best_score = cand, info, score
+
+    return best.astype(bool), best_info
 
 
-def overlay_abc(gray: np.ndarray, label: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    """Create RGB overlay: A=red, B=green, C=blue. No dependency on matplotlib."""
-    if gray.ndim == 2:
-        rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+def zhang_suen_skeleton(mask: np.ndarray, pad: int = 4) -> np.ndarray:
+    """Skeletonize binary mask with border padding.
+
+    skimage.morphology.skeletonize uses a thinning algorithm suitable for
+    Zhang-Suen style skeleton extraction on binary objects. Padding reduces
+    fake skeleton legs created at image borders.
+    """
+    mask = mask.astype(bool)
+    padded = np.pad(mask, pad_width=pad, mode="constant", constant_values=False)
+    skel = skeletonize(padded)
+    if pad > 0:
+        skel = skel[pad:-pad, pad:-pad]
+    return skel.astype(bool)
+
+
+def _neighbor_count(binary: np.ndarray) -> np.ndarray:
+    b = binary.astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    count = cv2.filter2D(b, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+    return count - b
+
+
+def analyze_skeleton(mask_or_skeleton: np.ndarray, already_skeleton: bool = False) -> Dict[str, int | str | float]:
+    if already_skeleton:
+        skel = mask_or_skeleton.astype(bool)
     else:
-        rgb = gray.copy()
-    overlay = rgb.copy().astype(np.float32)
-    colors = {
-        1: np.array([255, 30, 30], dtype=np.float32),
-        2: np.array([30, 220, 30], dtype=np.float32),
-        3: np.array([30, 80, 255], dtype=np.float32),
+        skel = zhang_suen_skeleton(mask_or_skeleton)
+
+    n = _neighbor_count(skel)
+    endpoints = int(np.logical_and(skel, n == 1).sum())
+    branch_points = int(np.logical_and(skel, n >= 3).sum())
+    components = int(cc_label(skel, connectivity=2).max())
+    pixels = int(skel.sum())
+
+    # A clean single chromosome skeleton is expected to be one unbranched path.
+    if pixels == 0:
+        status = "empty"
+    elif components != 1:
+        status = "invalid_components"
+    elif endpoints != 2:
+        status = "invalid_endpoints"
+    elif branch_points != 0:
+        status = "invalid_branch_points"
+    else:
+        status = "valid_single_path"
+
+    return {
+        "status": status,
+        "components": components,
+        "endpoints": endpoints,
+        "branch_points": branch_points,
+        "skeleton_pixels": pixels,
     }
-    for cls, color in colors.items():
-        m = label == cls
-        overlay[m] = (1 - alpha) * overlay[m] + alpha * color
-    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+def preprocess_folder(
+    src_dir: Path,
+    dst_dir: Path,
+    skeleton_dir: Path | None,
+    image_size: int,
+    use_skeleton: bool,
+    save_skeleton_debug: bool,
+    csv_path: Path,
+) -> List[Dict[str, str | int | float]]:
+    ensure_dir(dst_dir)
+    if skeleton_dir is not None:
+        ensure_dir(skeleton_dir)
+    rows = []
+    for path in list_images(src_dir):
+        gray = read_gray(path, image_size=image_size)
+        out_path = dst_dir / f"{path.stem}.png"
+        save_gray(out_path, gray)
+
+        row: Dict[str, str | int | float] = {
+            "filename": out_path.name,
+            "source_path": str(path),
+            "resized_path": str(out_path),
+            "image_size": image_size,
+        }
+
+        if use_skeleton:
+            mask = clean_mask(foreground_mask(gray), min_size=max(10, image_size // 10))
+            skel = zhang_suen_skeleton(mask, pad=4)
+            info = analyze_skeleton(skel, already_skeleton=True)
+            row.update(info)
+            if save_skeleton_debug and skeleton_dir is not None:
+                skel_path = skeleton_dir / f"{path.stem}_skeleton.png"
+                save_gray(skel_path, (skel.astype(np.uint8) * 255))
+                row["skeleton_path"] = str(skel_path)
+        else:
+            row.update({
+                "status": "skipped",
+                "components": -1,
+                "endpoints": -1,
+                "branch_points": -1,
+                "skeleton_pixels": -1,
+            })
+
+        rows.append(row)
+
+    ensure_dir(csv_path.parent)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        if rows:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        else:
+            f.write("filename,status\n")
+    return rows
+
+
+def make_overlay(gray: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray, mask_c: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    base = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+    color = base.copy()
+    # A = red, B = green, C = yellow for easy visual checking.
+    color[mask_a.astype(bool)] = np.array([255, 60, 60], dtype=np.float32)
+    color[mask_b.astype(bool)] = np.array([60, 255, 60], dtype=np.float32)
+    color[mask_c.astype(bool)] = np.array([255, 230, 40], dtype=np.float32)
+    out = (base * (1 - alpha) + color * alpha).clip(0, 255).astype(np.uint8)
+    return out
+
+
+def save_rgb(path: Path, arr: np.ndarray) -> None:
+    ensure_dir(path.parent)
+    Image.fromarray(arr.astype(np.uint8), mode="RGB").save(path)
+
+
+def read_label(path: Path) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+
+
+def write_csv(path: Path, rows: List[Dict]) -> None:
+    ensure_dir(path.parent)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = sorted({k for row in rows for k in row.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)

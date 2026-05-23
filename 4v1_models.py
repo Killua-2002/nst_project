@@ -4,183 +4,157 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class SEBlock(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        hidden = max(channels // reduction, 4)
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.fc(x)
+from config import NUM_CLASSES, DEFAULT_DROPOUT
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, dropout=0.0):
         super().__init__()
         layers = [
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.Conv2d(in_ch, out_ch, k, s, p, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            SEBlock(out_ch),
         ]
         if dropout > 0:
             layers.append(nn.Dropout2d(dropout))
-        self.net = nn.Sequential(*layers)
+        self.block = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class CCINetTeacherSeg(nn.Module):
-    """CCI-Net-inspired teacher for 4-class A/B/C segmentation.
-
-    It uses a CNN backbone, SE attention blocks, multi-scale feature fusion, and a decoder.
-    Output classes: 0 background, 1 A-only, 2 B-only, 3 C-overlap.
-    """
-    def __init__(self, num_classes: int = 4, dropout: float = 0.5, base: int = 16):
-        super().__init__()
-        self.e1 = ConvBlock(1, base, dropout=0.0)
-        self.e2 = ConvBlock(base, base * 2, dropout=0.1)
-        self.e3 = ConvBlock(base * 2, base * 4, dropout=dropout)
-        self.e4 = ConvBlock(base * 4, base * 8, dropout=dropout)
-        self.pool = nn.MaxPool2d(2)
-
-        self.mff1 = nn.Conv2d(base, base, 1)
-        self.mff2 = nn.Conv2d(base * 2, base, 1)
-        self.mff3 = nn.Conv2d(base * 4, base, 1)
-        self.mff4 = nn.Conv2d(base * 8, base, 1)
-
-        self.d3 = ConvBlock(base * 8 + base * 4, base * 4, dropout=dropout)
-        self.d2 = ConvBlock(base * 4 + base * 2, base * 2, dropout=0.1)
-        self.d1 = ConvBlock(base * 2 + base, base, dropout=0.0)
-        self.fuse = ConvBlock(base * 2, base * 2, dropout=0.1)
-        self.out = nn.Conv2d(base * 2, num_classes, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.e1(x)
-        e2 = self.e2(self.pool(e1))
-        e3 = self.e3(self.pool(e2))
-        e4 = self.e4(self.pool(e3))
-
-        d3 = F.interpolate(e4, size=e3.shape[-2:], mode="bilinear", align_corners=False)
-        d3 = self.d3(torch.cat([d3, e3], dim=1))
-        d2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
-        d2 = self.d2(torch.cat([d2, e2], dim=1))
-        d1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        d1 = self.d1(torch.cat([d1, e1], dim=1))
-
-        # Multi-scale feature fusion like CCI-Net style.
-        f1 = self.mff1(e1)
-        f2 = F.interpolate(self.mff2(e2), size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        f3 = F.interpolate(self.mff3(e3), size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        f4 = F.interpolate(self.mff4(e4), size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        fused = self.fuse(torch.cat([d1, f1 + f2 + f3 + f4], dim=1))
-        return self.out(fused)
-
-
-class WindowAttentionBlock(nn.Module):
-    """Lightweight Swin-style local window attention block for FPN features.
-
-    This version uses local window/depthwise attention gates instead of full MHA so the
-    notebook can run reliably on Colab. It keeps the Swin idea of local-window context.
-    """
-    def __init__(self, dim: int = 32, heads: int = 4, window_size: int = 7, dropout: float = 0.1):
-        super().__init__()
-        self.local_gate = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=window_size, padding=window_size // 2, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.Sigmoid(),
-        )
-        self.proj = nn.Sequential(
-            nn.Conv2d(dim, dim, 1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.GELU(),
-            nn.Dropout2d(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.proj(x * self.local_gate(x))
+    def forward(self, x):
+        return self.block(x)
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+    def __init__(self, ch, dropout=0.0):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.skip = nn.Identity()
-        if stride != 1 or in_ch != out_ch:
-            self.skip = nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False), nn.BatchNorm2d(out_ch))
+        self.c1 = ConvBNReLU(ch, ch, dropout=dropout)
+        self.c2 = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch),
+        )
+        self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        y = self.bn2(self.conv2(y))
-        return F.relu(y + self.skip(x), inplace=True)
+    def forward(self, x):
+        return self.relu(x + self.c2(self.c1(x)))
 
 
-class SwinResNetFPNStudentSeg(nn.Module):
-    """Student segmentation model: lightweight Swin + ResNet-FPN-v2 inspired.
+class CCINetTeacher(nn.Module):
+    """Compact CCI-Net style teacher for A/B/C segmentation.
 
-    The original requested name is kept, but this implementation is intentionally
-    lightweight for Google Colab: residual CNN encoder, FPN multi-scale fusion,
-    and a local window attention gate similar to Swin's local-context idea.
+    It is not a classifier. Output shape is [B,4,H,W] with classes:
+    background, A-only, B-only, C-overlap.
     """
-    def __init__(self, num_classes: int = 4, dropout: float = 0.5, fpn_dim: int = 32):
-        super().__init__()
-        self.e1 = ConvBlock(1, 32, dropout=0.0)          # H
-        self.e2 = ConvBlock(32, 64, dropout=0.1)         # H/2
-        self.e3 = ConvBlock(64, 128, dropout=dropout)    # H/4
-        self.e4 = ConvBlock(128, 128, dropout=dropout)   # H/8
-        self.pool = nn.MaxPool2d(2)
 
-        self.lat1 = nn.Conv2d(32, fpn_dim, 1)
-        self.lat2 = nn.Conv2d(64, fpn_dim, 1)
-        self.lat3 = nn.Conv2d(128, fpn_dim, 1)
-        self.lat4 = nn.Conv2d(128, fpn_dim, 1)
-        self.swin_block = WindowAttentionBlock(dim=fpn_dim, heads=4, window_size=7, dropout=0.1)
-        self.head = nn.Sequential(
-            ConvBlock(fpn_dim * 4, 64, dropout=dropout),
+    def __init__(self, num_classes=NUM_CLASSES, dropout=DEFAULT_DROPOUT):
+        super().__init__()
+        self.enc1 = nn.Sequential(ConvBNReLU(1, 32), ConvBNReLU(32, 32))
+        self.enc2 = nn.Sequential(ConvBNReLU(32, 64, s=2), ConvBNReLU(64, 64))
+        self.enc3 = nn.Sequential(ConvBNReLU(64, 128, s=2), ConvBNReLU(128, 128, dropout=dropout))
+        self.enc4 = nn.Sequential(ConvBNReLU(128, 256, s=2), ConvBNReLU(256, 256, dropout=dropout))
+
+        # Multi-scale feature fusion similar in spirit to CCI-Net MFF.
+        self.fuse3 = ConvBNReLU(256 + 128, 128, dropout=dropout)
+        self.fuse2 = ConvBNReLU(128 + 64, 64)
+        self.fuse1 = ConvBNReLU(64 + 32, 32)
+        self.head = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+
+        d3 = F.interpolate(e4, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = self.fuse3(torch.cat([d3, e3], dim=1))
+        d2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.fuse2(torch.cat([d2, e2], dim=1))
+        d1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        d1 = self.fuse1(torch.cat([d1, e1], dim=1))
+        out = self.head(d1)
+        return F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
+
+
+class WindowAttentionLite(nn.Module):
+    """Lightweight Swin-like local attention block.
+
+    Keeps the project Colab-friendly while preserving the intended idea:
+    local window context + CNN/FPN features.
+    """
+
+    def __init__(self, ch, window_size=7):
+        super().__init__()
+        self.window_size = window_size
+        self.qkv = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.norm = nn.BatchNorm2d(ch)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=1)
+        # Local context via depth-wise average as a stable approximation.
+        k_ctx = F.avg_pool2d(k, kernel_size=self.window_size, stride=1, padding=self.window_size // 2)
+        att = torch.sigmoid((q * k_ctx).sum(dim=1, keepdim=True) / (c ** 0.5))
+        out = self.proj(v * att)
+        return self.norm(out + x)
+
+
+class StudentSwinResNetFPNV2(nn.Module):
+    """Student segmentation model: Swin-like context + ResNet50-FPN-v2 style decoder.
+
+    Output is pixel-level A/B/C segmentation, not image classification.
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, dropout=DEFAULT_DROPOUT):
+        super().__init__()
+        self.stem = nn.Sequential(ConvBNReLU(1, 32), ConvBNReLU(32, 64, s=2))
+        self.layer1 = nn.Sequential(ResidualBlock(64), ResidualBlock(64))
+        self.down2 = ConvBNReLU(64, 128, s=2)
+        self.layer2 = nn.Sequential(ResidualBlock(128), ResidualBlock(128))
+        self.down3 = ConvBNReLU(128, 256, s=2)
+        self.layer3 = nn.Sequential(ResidualBlock(256, dropout=dropout), ResidualBlock(256, dropout=dropout))
+        self.down4 = ConvBNReLU(256, 512, s=2)
+        self.layer4 = nn.Sequential(ResidualBlock(512, dropout=dropout), WindowAttentionLite(512), ResidualBlock(512, dropout=dropout))
+
+        # FPN v2 style lateral + top-down fusion.
+        self.lat4 = nn.Conv2d(512, 128, 1)
+        self.lat3 = nn.Conv2d(256, 128, 1)
+        self.lat2 = nn.Conv2d(128, 128, 1)
+        self.lat1 = nn.Conv2d(64, 128, 1)
+
+        self.smooth3 = ConvBNReLU(128, 128)
+        self.smooth2 = ConvBNReLU(128, 128)
+        self.smooth1 = ConvBNReLU(128, 128)
+
+        self.decoder = nn.Sequential(
+            ConvBNReLU(128, 96),
+            nn.Dropout2d(dropout),
+            ConvBNReLU(96, 64),
             nn.Conv2d(64, num_classes, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_size = x.shape[-2:]
-        e1 = self.e1(x)
-        e2 = self.e2(self.pool(e1))
-        e3 = self.e3(self.pool(e2))
-        e4 = self.e4(self.pool(e3))
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        c1 = self.layer1(self.stem(x))     # /2
+        c2 = self.layer2(self.down2(c1))   # /4
+        c3 = self.layer3(self.down3(c2))   # /8
+        c4 = self.layer4(self.down4(c3))   # /16
 
-        p4 = self.lat4(e4)
-        p3 = self.lat3(e3) + F.interpolate(p4, size=e3.shape[-2:], mode="nearest")
-        p2 = self.lat2(e2) + F.interpolate(p3, size=e2.shape[-2:], mode="nearest")
-        p1 = self.lat1(e1) + F.interpolate(p2, size=e1.shape[-2:], mode="nearest")
-        p1 = self.swin_block(p1)
+        p4 = self.lat4(c4)
+        p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="nearest")
+        p3 = self.smooth3(p3)
+        p2 = self.lat2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode="nearest")
+        p2 = self.smooth2(p2)
+        p1 = self.lat1(c1) + F.interpolate(p2, size=c1.shape[-2:], mode="nearest")
+        p1 = self.smooth1(p1)
 
-        size = p1.shape[-2:]
-        y = torch.cat([
-            p1,
-            F.interpolate(p2, size=size, mode="bilinear", align_corners=False),
-            F.interpolate(p3, size=size, mode="bilinear", align_corners=False),
-            F.interpolate(p4, size=size, mode="bilinear", align_corners=False),
-        ], dim=1)
-        return F.interpolate(self.head(y), size=input_size, mode="bilinear", align_corners=False)
+        out = self.decoder(p1)
+        return F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
 
 
-def build_model(name: str, num_classes: int = 4, dropout: float = 0.5) -> nn.Module:
-    key = name.lower().strip()
+def build_model(name: str, dropout: float = DEFAULT_DROPOUT, num_classes: int = NUM_CLASSES):
+    key = name.lower()
     if key in {"teacher", "cci", "cci-net", "ccinet"}:
-        return CCINetTeacherSeg(num_classes=num_classes, dropout=dropout)
-    if key in {"student", "swin-resnet-fpn", "swin_resnet_fpn"}:
-        return SwinResNetFPNStudentSeg(num_classes=num_classes, dropout=dropout)
+        return CCINetTeacher(num_classes=num_classes, dropout=dropout)
+    if key in {"student", "swin", "swin-resnet-fpn", "swin_resnet_fpn_v2"}:
+        return StudentSwinResNetFPNV2(num_classes=num_classes, dropout=dropout)
     raise ValueError(f"Unknown model name: {name}")

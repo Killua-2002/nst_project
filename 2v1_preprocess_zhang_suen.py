@@ -1,55 +1,51 @@
 import argparse
 
-import pandas as pd
+from config import (
+    DEFAULT_IMAGE_SIZE,
+    GENERATED_DIR,
+    OVERLAP_RAW_DIR,
+    RESIZED_DIR,
+    SINGLE_CHROMOSOMES_DIR,
+    SKELETON_DIR,
+)
+from utils_image import preprocess_folder
 
-import config
-from src.skeleton_utils import process_folder
-from src.utils import list_images
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Resize + grayscale all source images and optionally run Zhang-Suen skeleton QC.")
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--use-skeleton", action="store_true", help="Enable Zhang-Suen skeleton QC.")
+    parser.add_argument("--save-skeleton-debug", action="store_true", help="Save skeleton PNG files.")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess: grayscale + resize all images, optional Zhang-Suen skeleton.")
-    parser.add_argument("--image-size", type=int, default=config.IMAGE_SIZE)
-    parser.add_argument("--pad", type=int, default=config.SKELETON_PAD, help="Padding border before Zhang-Suen thinning.")
-    parser.add_argument("--use-skeleton", action="store_true", help="Enable binary + Zhang-Suen skeleton analysis.")
-    parser.add_argument("--save-skeleton-debug", action="store_true", help="Save gray/binary/skeleton/overlay debug images.")
-    args = parser.parse_args()
+    args = parse_args()
+    print(f"[PREPROCESS] image_size={args.image_size}, use_skeleton={args.use_skeleton}")
 
-    config.ensure_project_dirs()
-    single_dir = config.get_single_dir()
-
-    print("Processing overlap_raw:", config.OVERLAP_RAW_DIR)
-    overlap_df = process_folder(
-        config.OVERLAP_RAW_DIR,
-        config.GENERATED_DIR / "overlap_raw",
+    rows_single = preprocess_folder(
+        src_dir=SINGLE_CHROMOSOMES_DIR,
+        dst_dir=RESIZED_DIR / "single_chromosomes",
+        skeleton_dir=SKELETON_DIR / "single_chromosomes",
         image_size=args.image_size,
-        pad=args.pad,
-        run_skeleton=args.use_skeleton,
+        use_skeleton=args.use_skeleton,
         save_skeleton_debug=args.save_skeleton_debug,
-        resized_dir=config.RESIZED_OVERLAP_RAW_DIR,
-    )
-    print("Processing single chromosomes:", single_dir)
-    single_df = process_folder(
-        single_dir,
-        config.GENERATED_DIR / "single_chromosomes",
-        image_size=args.image_size,
-        pad=args.pad,
-        run_skeleton=args.use_skeleton,
-        save_skeleton_debug=args.save_skeleton_debug,
-        resized_dir=config.RESIZED_SINGLE_CHROMOSOMES_DIR,
+        csv_path=GENERATED_DIR / "single_chromosomes_skeleton_qc.csv",
     )
 
-    overlap_df["source"] = "overlap_raw"
-    single_df["source"] = "single_chromosomes"
-    all_df = pd.concat([overlap_df, single_df], ignore_index=True)
-    all_df.to_csv(config.GENERATED_DIR / "all_preprocess_stats.csv", index=False)
+    rows_overlap = preprocess_folder(
+        src_dir=OVERLAP_RAW_DIR,
+        dst_dir=RESIZED_DIR / "overlap_raw",
+        skeleton_dir=SKELETON_DIR / "overlap_raw",
+        image_size=args.image_size,
+        use_skeleton=args.use_skeleton,
+        save_skeleton_debug=args.save_skeleton_debug,
+        csv_path=GENERATED_DIR / "overlap_raw_skeleton_qc.csv",
+    )
 
-    print("Done.")
-    print("original overlap_raw images:", len(list_images(config.OVERLAP_RAW_DIR)))
-    print("original single_chromosome images:", len(list_images(single_dir)))
-    print("resized overlap_raw images:", len(list_images(config.RESIZED_OVERLAP_RAW_DIR)))
-    print("resized single_chromosome images:", len(list_images(config.RESIZED_SINGLE_CHROMOSOMES_DIR)))
-    print("Stats saved to generated_data/all_preprocess_stats.csv")
+    print(f"[OK] resized single_chromosomes: {len(rows_single)}")
+    print(f"[OK] resized overlap_raw: {len(rows_overlap)}")
+    print("[OK] Preprocess done.")
 
 
 if __name__ == "__main__":

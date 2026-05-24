@@ -1,3 +1,4 @@
+
 import argparse
 import csv
 import importlib.util
@@ -8,6 +9,7 @@ import torch
 from tqdm import tqdm
 
 from config import DEFAULT_DROPOUT, DEFAULT_IMAGE_SIZE, MODEL_DIR, OVERLAP_RESULT_DIR, RESIZED_DIR
+from shape_classifier_model import load_shape_classifier
 from utils_image import (
     analyze_skeleton,
     clean_mask,
@@ -23,6 +25,7 @@ from utils_image import (
     save_rgb,
     zhang_suen_skeleton,
 )
+from utils_shape_guided import choose_best_shape_guided_pair
 
 
 def _load_models_module():
@@ -33,17 +36,21 @@ def _load_models_module():
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Segment overlap_raw into chromosome A, chromosome B, and overlap region C.")
+    p = argparse.ArgumentParser(
+        description="Hybrid Classif + Segmentation: segment overlap_raw into NST A, NST B and C-overlap."
+    )
     p.add_argument("--model", choices=["student", "teacher"], default="student")
     p.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     p.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     p.add_argument("--prob-threshold", type=float, default=0.45)
     p.add_argument("--keep-largest", action="store_true", help="Keep largest connected component of A and B masks.")
     p.add_argument("--no-shape-postprocess", action="store_true", help="Disable morphology hole filling / smoothing.")
-    p.add_argument("--no-skeleton-repair", action="store_true", help="Disable skeleton-guided candidate selection.")
+    p.add_argument("--no-skeleton-repair", action="store_true", help="Disable Zhang-Suen-guided candidate selection.")
+    p.add_argument("--no-shape-classifier", action="store_true", help="Disable classifier-guided shape selection.")
     p.add_argument("--close-radius", type=int, default=2, help="Morphological closing radius for A/B shape repair.")
     p.add_argument("--hole-area", type=int, default=768, help="Fill holes up to this area inside A/B masks.")
     p.add_argument("--min-object-size", type=int, default=35, help="Remove connected components smaller than this.")
+    p.add_argument("--visualize-limit", type=int, default=80, help="Save multi-panel raw visualizations for first N images. Use -1 for all.")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -65,6 +72,16 @@ def _predict(model, gray: np.ndarray, device):
     return prob, label, confidence
 
 
+def _raw_masks_from_prob(prob: np.ndarray, label: np.ndarray, threshold: float):
+    p_a = prob[1] + prob[3]
+    p_b = prob[2] + prob[3]
+    p_c = prob[3]
+    raw_a = np.logical_or(p_a >= threshold, np.logical_or(label == 1, label == 3))
+    raw_b = np.logical_or(p_b >= threshold, np.logical_or(label == 2, label == 3))
+    raw_c = np.logical_or(p_c >= threshold, label == 3)
+    return raw_a.astype(bool), raw_b.astype(bool), raw_c.astype(bool)
+
+
 def _abc_from_prob(
     prob: np.ndarray,
     label: np.ndarray,
@@ -76,35 +93,30 @@ def _abc_from_prob(
     close_radius: int,
     hole_area: int,
     min_object_size: int,
+    shape_classifier=None,
+    device=None,
 ):
-    """Convert network output to A/B/C masks with shape-aware repair.
+    """Convert network output to final A/B/C with classifier + segment hybrid.
 
-    The network predicts 4 exclusive classes: background, A-only, B-only, C-overlap.
-    For final output, A and B are non-exclusive because both include the C region:
-        A = A-only + C
-        B = B-only + C
-        C = overlap
+    Core idea:
+    1. Student/Teacher segmentation gives pixel probabilities for A/B/C.
+    2. Raw grayscale foreground gives actual NST body.
+    3. Shape classifier checks whether A and B look like real single chromosomes.
+    4. Zhang-Suen skeleton QC rejects holey/non-chromosome-like candidates.
+    5. Best candidate is saved as final A/B/C.
 
-    Segmentation often creates small holes inside A/B. This function fixes that by
-    using the original image foreground + morphology + Zhang-Suen skeleton QC.
+    This avoids the old failure mode where mask_A/mask_B became spotty blobs that
+    did not preserve NST morphology.
     """
-    p_a = prob[1] + prob[3]
-    p_b = prob[2] + prob[3]
-    p_c = prob[3]
+    raw_a, raw_b, raw_c = _raw_masks_from_prob(prob, label, threshold)
 
-    raw_a = np.logical_or(p_a >= threshold, np.logical_or(label == 1, label == 3))
-    raw_b = np.logical_or(p_b >= threshold, np.logical_or(label == 2, label == 3))
-    raw_c = np.logical_or(p_c >= threshold, label == 3)
-
-    # Foreground from original grayscale image keeps output on chromosome body,
-    # so A/B shape is closer to the real object instead of holey probability blobs.
-    fg = clean_mask(foreground_mask(gray), min_size=max(min_object_size, gray.shape[0] // 4))
+    fg = clean_mask(foreground_mask(gray), min_size=max(min_object_size, gray.shape[0] // 14))
 
     raw_a_info = analyze_skeleton(raw_a, already_skeleton=False)
     raw_b_info = analyze_skeleton(raw_b, already_skeleton=False)
 
     if shape_postprocess:
-        mask_a, post_a_info = refine_single_chromosome_shape(
+        base_a, post_a_info = refine_single_chromosome_shape(
             raw_a,
             foreground=fg,
             min_size=min_object_size,
@@ -113,7 +125,7 @@ def _abc_from_prob(
             keep_largest=keep_largest,
             skeleton_repair=skeleton_repair,
         )
-        mask_b, post_b_info = refine_single_chromosome_shape(
+        base_b, post_b_info = refine_single_chromosome_shape(
             raw_b,
             foreground=fg,
             min_size=min_object_size,
@@ -122,7 +134,7 @@ def _abc_from_prob(
             keep_largest=keep_largest,
             skeleton_repair=skeleton_repair,
         )
-        mask_c = refine_binary_mask(
+        base_c = refine_binary_mask(
             raw_c,
             foreground=fg,
             close_radius=max(1, close_radius - 1),
@@ -131,21 +143,54 @@ def _abc_from_prob(
             keep_largest=False,
             foreground_margin=1,
         )
+
+        # Hybrid classification + segmentation candidate selection.
+        if shape_classifier is not None or skeleton_repair:
+            best = choose_best_shape_guided_pair(
+                gray=gray,
+                prob=prob,
+                label=label,
+                raw_a=raw_a,
+                raw_b=raw_b,
+                raw_c=raw_c,
+                base_a=base_a,
+                base_b=base_b,
+                base_c=base_c,
+                close_radius=close_radius,
+                hole_area=hole_area,
+                min_object_size=min_object_size,
+                keep_largest=keep_largest,
+                shape_classifier=shape_classifier,
+                device=device,
+            )
+            mask_a, mask_b, mask_c = best.a, best.b, best.c
+            chosen = best.name
+            chosen_score = best.score
+            chosen_detail = best.detail
+        else:
+            mask_a, mask_b, mask_c = base_a, base_b, base_c
+            chosen = "segment_morphology_only"
+            chosen_score = 0.0
+            chosen_detail = {}
     else:
         mask_a, mask_b, mask_c = raw_a, raw_b, raw_c
         post_a_info = analyze_skeleton(mask_a, already_skeleton=False)
         post_b_info = analyze_skeleton(mask_b, already_skeleton=False)
+        chosen = "raw_segment_only"
+        chosen_score = 0.0
+        chosen_detail = {}
 
-    # C must be the shared region between the two recognized chromosomes.
-    shared = mask_a & mask_b
-    if shared.sum() > 0:
-        mask_c = (mask_c & shared) | shared
-    else:
-        mask_c = mask_c & (mask_a | mask_b)
+    # C is the shared overlapping region between the two recognized chromosomes.
+    mask_c = mask_c.astype(bool) & mask_a.astype(bool) & mask_b.astype(bool)
+    if mask_c.sum() == 0:
+        # Use a small contact band if classifier/watershed made A and B touch but C vanished.
+        from skimage.morphology import binary_dilation, disk
+        contact = binary_dilation(mask_a, disk(2)) & binary_dilation(mask_b, disk(2)) & fg
+        mask_c = contact.astype(bool)
 
     # Ensure final A/B include overlap C.
-    mask_a = mask_a | mask_c
-    mask_b = mask_b | mask_c
+    mask_a = mask_a.astype(bool) | mask_c
+    mask_b = mask_b.astype(bool) | mask_c
 
     label_out = np.zeros(label.shape, dtype=np.uint8)
     label_out[np.logical_and(mask_a, ~mask_b)] = 1
@@ -169,8 +214,40 @@ def _abc_from_prob(
         "post_B_endpoints": post_b_info["endpoints"],
         "post_B_branch_points": post_b_info["branch_points"],
         "post_B_components": post_b_info["components"],
+        "chosen_refine_method": chosen,
+        "chosen_refine_score": chosen_score,
+        **{f"chosen_{k}": v for k, v in chosen_detail.items()},
     }
     return mask_a, mask_b, mask_c, label_out, raw_a, raw_b, raw_c, debug
+
+
+def _make_visual_check(gray, raw_overlay, final_overlay, mask_a, mask_b, mask_c, skel_a, skel_b, out_path):
+    """Save multi-panel visualization directly on the raw/resized NST image."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 4, figsize=(13, 7))
+    axes = axes.ravel()
+
+    panels = [
+        ("Raw grayscale NST", gray, "gray"),
+        ("Raw model overlay", raw_overlay, None),
+        ("Final A/B/C overlay", final_overlay, None),
+        ("Mask C overlap", mask_c.astype(np.uint8) * 255, "gray"),
+        ("Final mask A", mask_a.astype(np.uint8) * 255, "gray"),
+        ("Final mask B", mask_b.astype(np.uint8) * 255, "gray"),
+        ("Skeleton A", skel_a.astype(np.uint8) * 255, "gray"),
+        ("Skeleton B", skel_b.astype(np.uint8) * 255, "gray"),
+    ]
+
+    for ax, (title, img, cmap) in zip(axes, panels):
+        ax.imshow(img, cmap=cmap)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+
+    fig.tight_layout()
+    ensure_dir(Path(out_path).parent)
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
 
 
 def main():
@@ -187,16 +264,26 @@ def main():
     _load_checkpoint(ckpt_path, model, device)
     model.eval()
 
+    shape_classifier = None
+    shape_ckpt = MODEL_DIR / "shape_classifier_valid_nst_best.pth"
+    if not args.no_shape_classifier:
+        shape_classifier = load_shape_classifier(shape_ckpt, device=device, dropout=args.dropout)
+        if shape_classifier is None:
+            print(f"[WARN] Shape-classifier checkpoint not found: {shape_ckpt}")
+            print("[WARN] Continuing with segmentation + skeleton scoring only.")
+        else:
+            print("[OK] Loaded shape classifier:", shape_ckpt)
+
     raw_dir = RESIZED_DIR / "overlap_raw"
     images = list_images(raw_dir)
     if not images:
         raise RuntimeError(f"No resized overlap_raw images found in {raw_dir}. Run 2v1_preprocess_zhang_suen.py first.")
 
-    for sub in ["labels", "masks_A", "masks_B", "masks_C", "raw_masks", "skeleton_qc", "overlays"]:
+    for sub in ["labels", "masks_A", "masks_B", "masks_C", "raw_masks", "skeleton_qc", "overlays", "visualizations"]:
         ensure_dir(OVERLAP_RESULT_DIR / sub)
 
     rows = []
-    for path in tqdm(images, desc=f"Segment overlap_raw with {args.model}"):
+    for idx, path in enumerate(tqdm(images, desc=f"Hybrid Classif+Seg overlap_raw with {args.model}")):
         gray = read_gray(path, image_size=args.image_size)
         prob, raw_label, conf = _predict(model, gray, device)
         mask_a, mask_b, mask_c, label_out, raw_a, raw_b, raw_c, debug = _abc_from_prob(
@@ -210,6 +297,8 @@ def main():
             close_radius=args.close_radius,
             hole_area=args.hole_area,
             min_object_size=args.min_object_size,
+            shape_classifier=None if args.no_shape_classifier else shape_classifier,
+            device=device,
         )
 
         stem = path.stem
@@ -221,8 +310,10 @@ def main():
         save_gray(OVERLAP_RESULT_DIR / "raw_masks" / f"{stem}_raw_B_before_shape_repair.png", raw_b.astype(np.uint8) * 255)
         save_gray(OVERLAP_RESULT_DIR / "raw_masks" / f"{stem}_raw_C_before_shape_repair.png", raw_c.astype(np.uint8) * 255)
 
-        overlay = make_overlay(gray, mask_a, mask_b, mask_c)
-        save_rgb(OVERLAP_RESULT_DIR / "overlays" / f"{stem}_overlay_A_B_C.png", overlay)
+        raw_overlay = make_overlay(gray, raw_a, raw_b, raw_c)
+        final_overlay = make_overlay(gray, mask_a, mask_b, mask_c)
+        save_rgb(OVERLAP_RESULT_DIR / "overlays" / f"{stem}_overlay_A_B_C.png", final_overlay)
+        save_rgb(OVERLAP_RESULT_DIR / "overlays" / f"{stem}_raw_model_overlay_before_repair.png", raw_overlay)
 
         skel_a = zhang_suen_skeleton(mask_a, pad=4)
         skel_b = zhang_suen_skeleton(mask_b, pad=4)
@@ -231,10 +322,25 @@ def main():
         save_gray(OVERLAP_RESULT_DIR / "skeleton_qc" / f"{stem}_A_skeleton.png", skel_a.astype(np.uint8) * 255)
         save_gray(OVERLAP_RESULT_DIR / "skeleton_qc" / f"{stem}_B_skeleton.png", skel_b.astype(np.uint8) * 255)
 
+        if args.visualize_limit < 0 or idx < args.visualize_limit:
+            _make_visual_check(
+                gray=gray,
+                raw_overlay=raw_overlay,
+                final_overlay=final_overlay,
+                mask_a=mask_a,
+                mask_b=mask_b,
+                mask_c=mask_c,
+                skel_a=skel_a,
+                skel_b=skel_b,
+                out_path=OVERLAP_RESULT_DIR / "visualizations" / f"{stem}_visual_check_raw_A_B_C.png",
+            )
+
         rows.append({
             "filename": path.name,
             "model": args.model,
             "confidence_mean": conf,
+            "hybrid_classif_seg": not args.no_shape_classifier,
+            "shape_classifier_loaded": shape_classifier is not None,
             "shape_postprocess": not args.no_shape_postprocess,
             "skeleton_repair": not args.no_skeleton_repair,
             "A_pixels": int(mask_a.sum()),
@@ -258,9 +364,10 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    print("[OK] A/B/C segmentation outputs saved to:", OVERLAP_RESULT_DIR)
+    print("[OK] Hybrid A/B/C outputs saved to:", OVERLAP_RESULT_DIR)
     print("[OK] Summary CSV:", csv_path)
-    print("[OK] Shape repair is", "OFF" if args.no_shape_postprocess else "ON")
+    print("[OK] Visual checks:", OVERLAP_RESULT_DIR / "visualizations")
+    print("[OK] Shape classifier:", "OFF" if args.no_shape_classifier else ("LOADED" if shape_classifier is not None else "MISSING_FALLBACK_TO_SKELETON"))
 
 
 if __name__ == "__main__":

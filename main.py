@@ -1,9 +1,17 @@
+
 import argparse
 import subprocess
 import sys
-from pathlib import Path
 
-from config import DEFAULT_BATCH_SIZE, DEFAULT_EPOCHS, DEFAULT_IMAGE_SIZE, DEFAULT_LR, DEFAULT_PATIENCE, DEFAULT_PSEUDO_THRESHOLD, PROJECT_ROOT
+from config import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_EPOCHS,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_LR,
+    DEFAULT_PATIENCE,
+    DEFAULT_PSEUDO_THRESHOLD,
+    PROJECT_ROOT,
+)
 
 
 def run(cmd):
@@ -14,7 +22,7 @@ def run(cmd):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Full semi-supervised A/B/C chromosome segmentation pipeline.")
+    p = argparse.ArgumentParser(description="Full hybrid classif + semi-supervised A/B/C chromosome segmentation pipeline.")
     p.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -25,16 +33,27 @@ def parse_args():
     p.add_argument("--test-count", type=int, default=120)
     p.add_argument("--pseudo-threshold", type=float, default=DEFAULT_PSEUDO_THRESHOLD)
     p.add_argument("--device", type=str, default="cuda")
+
+    # Preprocess / synthetic data
     p.add_argument("--use-skeleton", action="store_true", help="Run Zhang-Suen skeleton QC during preprocessing.")
     p.add_argument("--strict-skeleton", action="store_true", help="Use only single chromosomes with valid one-path skeleton when generating synthetic data.")
     p.add_argument("--save-skeleton-debug", action="store_true")
-    p.add_argument("--skip-train", action="store_true")
     p.add_argument("--only-preprocess", action="store_true")
+
+    # Train control
+    p.add_argument("--skip-train", action="store_true", help="Skip teacher/student training and only run final prediction.")
+    p.add_argument("--skip-shape-classifier-train", action="store_true", help="Do not train the classification shape validator.")
+    p.add_argument("--shape-epochs", type=int, default=25, help="Epochs for the shape-classifier model.")
+    p.add_argument("--shape-max-count", type=int, default=4000, help="Max single chromosomes used for shape-classifier training.")
+
+    # Final A/B/C refinement
     p.add_argument("--keep-largest", action="store_true", help="Postprocess final A/B masks by keeping largest component.")
     p.add_argument("--no-shape-postprocess", action="store_true", help="Disable fill holes / smooth A/B shape after segmentation.")
     p.add_argument("--no-skeleton-repair", action="store_true", help="Disable Zhang-Suen-guided candidate selection for A/B masks.")
+    p.add_argument("--no-shape-classifier", action="store_true", help="Disable classifier-guided shape selection in final segmentation.")
     p.add_argument("--close-radius", type=int, default=2, help="Morphological closing radius for A/B shape repair.")
     p.add_argument("--hole-area", type=int, default=768, help="Fill holes up to this area in A/B masks.")
+    p.add_argument("--visualize-limit", type=int, default=80, help="Number of raw visualizations to save. Use -1 for all.")
     return p.parse_args()
 
 
@@ -57,6 +76,20 @@ def main():
     if args.only_preprocess:
         print("[OK] only-preprocess finished.")
         return
+
+    # Classification model for chromosome shape prior.
+    # This model is not the final output model. It scores candidate A/B masks and
+    # helps reject holey/non-chromosome-like segmentation results.
+    if not args.skip_train and not args.skip_shape_classifier_train and not args.no_shape_classifier:
+        run([
+            py, "4v2_train_shape_classifier.py",
+            "--epochs", str(args.shape_epochs),
+            "--batch-size", str(args.batch_size),
+            "--lr", str(args.lr),
+            "--image-size", str(args.image_size),
+            "--max-count", str(args.shape_max_count),
+            "--device", args.device,
+        ])
 
     synth_cmd = [
         py, "3v1_generate_synthetic_masks.py",
@@ -100,6 +133,7 @@ def main():
         "--model", "student",
         "--image-size", str(args.image_size),
         "--device", args.device,
+        "--visualize-limit", str(args.visualize_limit),
     ]
     if args.keep_largest:
         seg_cmd.append("--keep-largest")
@@ -107,11 +141,14 @@ def main():
         seg_cmd.append("--no-shape-postprocess")
     if args.no_skeleton_repair:
         seg_cmd.append("--no-skeleton-repair")
+    if args.no_shape_classifier:
+        seg_cmd.append("--no-shape-classifier")
     seg_cmd.extend(["--close-radius", str(args.close_radius), "--hole-area", str(args.hole_area)])
     run(seg_cmd)
 
     print("\n[OK] FULL PIPELINE DONE")
-    print("Check result/overlap_raw for masks_A, masks_B, masks_C, overlays, skeleton_qc and CSV.")
+    print("Check result/overlap_raw/visualizations for raw NST visual checks.")
+    print("Final outputs: masks_A, masks_B, masks_C, overlays, skeleton_qc and CSV.")
 
 
 if __name__ == "__main__":

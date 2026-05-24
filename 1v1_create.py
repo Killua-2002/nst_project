@@ -27,6 +27,8 @@ FOLDERS = [
     "result/overlap_raw/masks_C",
     "result/overlap_raw/skeleton_qc",
     "result/overlap_raw/overlays",
+    "result/overlap_raw/raw_masks",
+    "result/overlap_raw/visualizations",
 ]
 
 

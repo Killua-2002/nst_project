@@ -1,18 +1,18 @@
-# NST Project — Semi-supervised A/B/C Chromosome Segmentation
+# NST Project — Hybrid Classif + Semi-supervised A/B/C Segmentation
 
-## Mục tiêu đúng của project
+## Mục tiêu đúng
 
-Project này **không phân loại ảnh thành touching/overlapping/single**.
+Project này **không phân loại ảnh thành touching / overlapping / single**.
 
-Output đúng là nhận dạng trên từng ảnh trong `source_data/overlap_raw`:
+Output cuối cho từng ảnh trong `source_data/overlap_raw` là:
 
-- **NST A**
-- **NST B**
-- **Vùng C = vùng overlap giữa A và B**
+```text
+NST A
+NST B
+vùng C = vùng A và B chồng chéo
+```
 
-Bài toán được code lại thành **pixel-level segmentation**.
-
-Label map:
+Label map nội bộ:
 
 ```text
 0 = background
@@ -21,12 +21,54 @@ Label map:
 3 = C-overlap
 ```
 
-Khi xuất output:
+Khi xuất mask cuối:
 
 ```text
-mask_A = label 1 + label 3
-mask_B = label 2 + label 3
-mask_C = label 3
+mask_A = A-only + C
+mask_B = B-only + C
+mask_C = C-overlap
+```
+
+---
+
+## Vì sao thêm classification model?
+
+Bản segmentation thuần có thể tạo mask A/B bị lỗ chỗ, đứt đoạn hoặc không còn hình thái NST.
+
+Bản mới dùng hướng hybrid:
+
+```text
+Student segmentation dự đoán A/B/C
++
+classification shape model kiểm tra mask có giống một NST đơn không
++
+Zhang-Suen skeleton QC kiểm tra NST có dạng một đường đơn không phân nhánh
++
+watershed/foreground từ raw image để ép mask bám vào thân NST thật
+```
+
+Nói đơn giản: segmentation tìm vùng, classification + skeleton giữ hình dạng NST.
+
+---
+
+## Semi-supervised vẫn giữ
+
+Flow vẫn là Teacher–Student:
+
+```text
+source_data/single_chromosomes
+    ↓
+generate synthetic ảnh chồng + label A/B/C tự động
+    ↓
+train Teacher CCI-Net segmentation
+    ↓
+Teacher pseudo-label source_data/overlap_raw
+    ↓
+train Student Swin-like + ResNet-FPN-v2 segmentation
+    ↓
+Student predict overlap_raw
+    ↓
+Classification shape validator + skeleton repair chọn mask A/B tốt nhất
 ```
 
 ---
@@ -37,25 +79,17 @@ mask_C = label 3
 project/
 ├── source_data/
 │   ├── overlap_raw/              # ảnh thật cần nhận dạng A/B/C
-│   └── single_chromosomes/       # ảnh NST đơn lẻ để tạo synthetic train data
+│   └── single_chromosomes/       # ảnh NST đơn, dùng tạo synthetic + train shape classifier
 ├── generated_data/
 │   ├── resized/
 │   │   ├── overlap_raw/
 │   │   └── single_chromosomes/
 │   └── skeletons/
 ├── dataset/
-│   ├── train/
-│   │   ├── images/
-│   │   └── labels/
-│   ├── val/
-│   │   ├── images/
-│   │   └── labels/
-│   ├── test/
-│   │   ├── images/
-│   │   └── labels/
-│   └── pseudo/
-│       ├── images/
-│       └── labels/
+│   ├── train/images, train/labels
+│   ├── val/images, val/labels
+│   ├── test/images, test/labels
+│   └── pseudo/images, pseudo/labels
 ├── result/
 │   ├── models/
 │   ├── figures/
@@ -64,205 +98,139 @@ project/
 │       ├── masks_A/
 │       ├── masks_B/
 │       ├── masks_C/
-│       ├── skeleton_qc/
-│       └── overlays/
+│       ├── raw_masks/
+│       ├── overlays/
+│       ├── visualizations/
+│       └── skeleton_qc/
 ├── 1v1_create.py
 ├── 2v1_preprocess_zhang_suen.py
 ├── 3v1_generate_synthetic_masks.py
 ├── 4v1_models.py
+├── 4v2_train_shape_classifier.py
 ├── 5v1_train_teacher.py
 ├── 6v1_train_student_ssl.py
 ├── 7v1_evaluate_compare.py
 ├── 8v1_segment_overlap_raw.py
+├── shape_classifier_model.py
+├── utils_shape_guided.py
+├── utils_image.py
+├── utils_dataset.py
+├── utils_train.py
 ├── main.py
-├── config.py
 └── note.md
 ```
 
 ---
 
-## Flow xử lý
+## Chức năng file
 
-### 1. Preprocess
+### `1v1_create.py`
 
-File:
+Tạo toàn bộ folder cần thiết.
 
-```text
-2v1_preprocess_zhang_suen.py
-```
+### `2v1_preprocess_zhang_suen.py`
 
-Chức năng:
+- grayscale
+- resize all ảnh về `image_size`
+- optional Zhang-Suen skeleton QC
+- lưu ảnh resize vào `generated_data/resized`
 
-- resize toàn bộ ảnh về `224x224`
-- chuyển grayscale
-- tùy chọn bật Zhang-Suen skeleton QC
-- padding viền trước khi skeleton để giảm chân giả ở mép ảnh
-- lưu CSV kiểm tra skeleton
+### `3v1_generate_synthetic_masks.py`
 
-Chạy nhanh, không skeleton:
+Từ `single_chromosomes`, ghép 2 NST đơn để tạo ảnh chồng synthetic.
 
-```bash
-python 2v1_preprocess_zhang_suen.py --image-size 224
-```
-
-Chạy có Zhang-Suen skeleton:
-
-```bash
-python 2v1_preprocess_zhang_suen.py --image-size 224 --use-skeleton --save-skeleton-debug
-```
-
-Skeleton hợp lệ cho NST đơn:
+Sinh label:
 
 ```text
-components = 1
-endpoints = 2
-branch_points = 0
+0 background
+1 A-only
+2 B-only
+3 C-overlap
 ```
 
----
+### `4v1_models.py`
 
-### 2. Generate synthetic A/B/C masks
-
-File:
+Model segmentation:
 
 ```text
-3v1_generate_synthetic_masks.py
+Teacher = CCI-Net style segmentation
+Student = Swin-like + ResNet-FPN-v2 style segmentation
 ```
 
-Vì data gốc chỉ có:
+### `4v2_train_shape_classifier.py`
+
+Train classification model để học hình dạng NST đơn hợp lệ.
+
+Positive:
 
 ```text
-overlap_raw/          # ảnh thật không có label
-single_chromosomes/   # ảnh NST đơn
+mask foreground từ single_chromosomes
 ```
 
-nên code sẽ lấy 2 ảnh NST đơn, random rotate/scale/translate rồi ghép thành ảnh chồng giả lập.
-
-Khi tự ghép, ta biết được:
+Negative:
 
 ```text
-NST A nằm ở đâu
-NST B nằm ở đâu
-vùng C overlap nằm ở đâu
+mask bị cắt, lỗ, vỡ, island, noise, erode/dilate sai
 ```
 
-=> tạo được mask train tự động.
-
----
-
-### 3. Teacher model
-
-File:
+Model này không thay output A/B/C, mà dùng để score candidate mask A/B:
 
 ```text
-5v1_train_teacher.py
+mask này có giống NST đơn không?
 ```
 
-Teacher dùng CCI-Net style model để học synthetic A/B/C segmentation.
+### `5v1_train_teacher.py`
 
-Loss:
+Train Teacher CCI-Net trên synthetic A/B/C labels.
+
+### `6v1_train_student_ssl.py`
+
+Teacher tạo pseudo-label cho `overlap_raw`, sau đó Student học:
 
 ```text
-CrossEntropyLoss
+synthetic labeled data + pseudo-labeled overlap_raw
 ```
 
-Config:
+### `7v1_evaluate_compare.py`
 
-```text
-epoch = 200
-batch size = 64
-learning rate = 0.0001
-dropout = 0.5
-early stopping = 10
-```
-
----
-
-### 4. Semi-supervised Teacher-Student
-
-File:
-
-```text
-6v1_train_student_ssl.py
-```
-
-Flow:
-
-```text
-Teacher đã train
-↓
-Teacher predict overlap_raw thật
-↓
-tạo pseudo-label A/B/C
-↓
-Student học synthetic labels + pseudo labels
-```
-
-Student model:
-
-```text
-Swin-like Transformer + ResNet-FPN-v2 style segmentation model
-```
-
-Đây là bước semi-supervised chính.
-
----
-
-### 5. Evaluate
-
-File:
-
-```text
-7v1_evaluate_compare.py
-```
-
-Confusion matrix ở đây là **pixel-level confusion matrix**:
+Tạo pixel-level confusion matrix:
 
 ```text
 background / A-only / B-only / C-overlap
 ```
 
-Không phải confusion matrix classification touching/overlap/single.
+### `8v1_segment_overlap_raw.py`
 
----
+Final inference.
 
-### 6. Segment overlap_raw
-
-File:
+Output:
 
 ```text
-8v1_segment_overlap_raw.py
+result/overlap_raw/masks_A
+result/overlap_raw/masks_B
+result/overlap_raw/masks_C
+result/overlap_raw/overlays
+result/overlap_raw/visualizations
+result/overlap_raw/skeleton_qc
 ```
 
-Output cuối:
+Bước này dùng hybrid:
 
 ```text
-result/overlap_raw/
-├── labels/
-├── masks_A/
-├── masks_B/
-├── masks_C/
-├── skeleton_qc/
-├── overlays/
-└── overlap_raw_ABC_predictions_student.csv
-```
-
-CSV có thêm skeleton QC cho A và B:
-
-```text
-A_skeleton_status
-A_endpoints
-A_branch_points
-B_skeleton_status
-B_endpoints
-B_branch_points
+segmentation probabilities
++
+foreground raw image
++
+shape classifier score
++
+Zhang-Suen skeleton score
++
+watershed candidate
 ```
 
 ---
 
-## Chạy Colab nhanh
-
-Test nhanh:
+## Chạy nhanh Colab smoke test
 
 ```bash
 python main.py \
@@ -271,12 +239,19 @@ python main.py \
   --train-count 30 \
   --val-count 10 \
   --test-count 10 \
+  --shape-epochs 2 \
+  --shape-max-count 300 \
   --image-size 224 \
   --device cuda \
-  --use-skeleton
+  --keep-largest \
+  --close-radius 2 \
+  --hole-area 768 \
+  --visualize-limit 12
 ```
 
-Train thật:
+---
+
+## Train thật
 
 ```bash
 python main.py \
@@ -285,84 +260,66 @@ python main.py \
   --train-count 600 \
   --val-count 120 \
   --test-count 120 \
+  --shape-epochs 25 \
+  --shape-max-count 4000 \
   --lr 0.0001 \
+  --patience 10 \
   --image-size 224 \
   --device cuda \
-  --use-skeleton
-```
-
-Nếu skeleton quá chậm, có thể bỏ `--use-skeleton` khi train, rồi chạy skeleton QC sau:
-
-```bash
-python 2v1_preprocess_zhang_suen.py --image-size 224 --use-skeleton --save-skeleton-debug
-python 8v1_segment_overlap_raw.py --model student --image-size 224 --device cuda --keep-largest
+  --keep-largest \
+  --close-radius 2 \
+  --hole-area 768 \
+  --visualize-limit 80
 ```
 
 ---
 
-## Lưu ý quan trọng
+## Chạy lại final segmentation không train lại
 
-Classification chỉ trả lời ảnh thuộc loại nào. Project này cần nhận dạng NST A/B/C nên phải dùng segmentation.
-
-Semi-supervised learning vẫn được giữ:
-
-```text
-synthetic mask supervised learning
-+
-teacher pseudo-labeling overlap_raw
-+
-student training
-```
-
-Skeleton vẫn được dùng cho:
-
-```text
-preprocess QC
-lọc single_chromosomes khi cần strict_skeleton
-kiểm tra output A/B cuối cùng
-```
-
-## Update: shape-aware A/B/C output repair
-
-Bài toán cuối là nhận dạng pixel-level NST A, NST B và vùng C overlap trong `source_data/overlap_raw`, không phải classification touching/overlapping/single.
-
-Để tránh lỗi segment bị lỗ chỗ ở vùng NST A/B, bước `8v1_segment_overlap_raw.py` đã thêm post-processing mặc định:
-
-1. Lấy foreground từ ảnh grayscale gốc bằng Otsu để giới hạn mask trên thân NST thật.
-2. Fill holes trong A/B bằng `remove_small_holes`.
-3. Morphological closing để nối các vùng bị đứt nhỏ.
-4. Remove small islands để bỏ nhiễu.
-5. `--keep-largest` để giữ component chính của từng NST.
-6. Zhang-Suen skeleton QC trên A và B.
-7. Skeleton-guided candidate selection: thử nhiều mức close/fill và chọn mask có skeleton gần nhất với một đường đơn không phân nhánh.
-
-Output sau postprocess:
-
-```text
-result/overlap_raw/
-├── masks_A/          # NST A đã fill holes + shape repair
-├── masks_B/          # NST B đã fill holes + shape repair
-├── masks_C/          # vùng overlap C
-├── raw_masks/        # mask thô trước shape repair để so sánh
-├── skeleton_qc/      # skeleton A/B sau repair
-├── overlays/         # overlay A/B/C
-└── overlap_raw_ABC_predictions_student.csv
-```
-
-Lệnh train/predict mặc định nên dùng:
+Dùng khi đã có checkpoint và chỉ muốn chỉnh mask/visualization:
 
 ```bash
-python main.py --epochs 200 --batch-size 64 --train-count 600 --val-count 120 --test-count 120 --lr 0.0001 --image-size 224 --device cuda --use-skeleton --keep-largest
+python 8v1_segment_overlap_raw.py \
+  --model student \
+  --image-size 224 \
+  --device cuda \
+  --keep-largest \
+  --close-radius 3 \
+  --hole-area 1200 \
+  --visualize-limit -1
 ```
 
-Nếu mask vẫn còn lỗ hoặc răng cưa, tăng nhẹ:
+---
 
-```bash
-python 8v1_segment_overlap_raw.py --model student --image-size 224 --device cuda --keep-largest --close-radius 3 --hole-area 1200
+## Output cần xem đầu tiên
+
+Mở folder:
+
+```text
+result/overlap_raw/visualizations/
 ```
 
-Nếu muốn xem model thô chưa repair để debug:
+Mỗi ảnh visualization gồm:
 
-```bash
-python 8v1_segment_overlap_raw.py --model student --image-size 224 --device cuda --no-shape-postprocess
+```text
+raw grayscale NST
+raw model overlay trước repair
+final A/B/C overlay
+mask C
+mask A
+mask B
+skeleton A
+skeleton B
 ```
+
+Nếu mask A/B vẫn chưa đẹp:
+
+- tăng `--close-radius 3`
+- tăng `--hole-area 1200`
+- chạy lại `8v1_segment_overlap_raw.py`, không cần train lại
+
+---
+
+## Lưu ý
+
+Không có ground-truth mask thật cho `overlap_raw`, nên chất lượng cuối phụ thuộc vào synthetic generation + pseudo-label. Bản này sửa logic để không còn chỉ vẽ blob segmentation rỗ, mà ép mask A/B phải giống hình NST thật hơn bằng classification shape model và skeleton QC.
